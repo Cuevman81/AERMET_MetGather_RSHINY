@@ -36,5 +36,5 @@ Installation:
 
 Data Source:
 
-    ASOS data source: [NOAA ASOS Data](https://www.ncei.noaa.gov/data/automated-surface-observing-system-one-minute-pg1/access/)
-    ISH data source: [NOAA ISH Data](https://www1.ncdc.noaa.gov/pub/data/noaa/)
+    ASOS data source: [NOAA ASOS Data](https://www.ncei.noaa.gov/data/automated-surface-observing-system-one-minute-pg1/access/).
+    ISH data source: [NOAA ISH Data](https://www1.ncdc.noaa.gov/pub/data/noaa/).
