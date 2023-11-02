@@ -124,7 +124,7 @@ asos_server <- function(input, output, session) {
       output_dir_1min <- output_directories$output_dir_1min
       output_dir_5min <- output_directories$output_dir_5min
       
-      for (month in 1:1) {  # Iterate over all months
+      for (month in 1:12) {  # Iterate over all months
         url_1min <- paste0(url_base_1min, year, "/", sprintf("%02d", month), "/asos-1min-pg1-", selected_station, "-", year, sprintf("%02d", month), ".dat")
         file_name_1min <- paste0(selected_station, year, sprintf("%02d", month), ".dat")
         file_path_1min <- file.path(output_dir_1min, file_name_1min)
