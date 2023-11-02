@@ -1,4 +1,4 @@
-# AERMET_GATHER_RSHINY
+# AERMET_MetGather_RSHINY
 An RSHINY app to acquire AERMET data from various ASOS Stations.
 
 ASOS and ISH Data Downloader
