@@ -1,614 +1,405 @@
+# =============================================================================
+# AERMET NOAA Data Downloader  (R Shiny)
+# -----------------------------------------------------------------------------
+# Gathers the raw surface inputs needed to build AERMOD-ready met files with the
+# MDEQ AERMET pipeline (AERMET.R):
+#
+#   * ASOS 1-minute & 5-minute data  -> drives AERMINUTE (hourly winds/calms)
+#   * GHCNh hourly surface data (.psv) -> AERMET Stage 1 surface observations
+#
+# 2025/2026 modernization notes
+#   * The Integrated Surface Hourly (ISHD / DS3505) archive was retired by NCEI
+#     in August 2025.  This app no longer downloads the old gzipped
+#     `<USAF>-<WBAN>-YYYY.gz` files; the GHCNh tab replaces it and pulls the same
+#     pipe-delimited by-year files (`GHCNh_<id>_<YYYY>.psv`) that AERMET.R uses.
+#   * The station list now comes from the modern NCEI ISD-history CSV
+#     (`www.ncei.noaa.gov`), not the legacy `www1.ncdc.noaa.gov` fixed-width
+#     MASTER-STN-HIST.TXT (that host now 301-redirects).
+#   * GHCNh output is named `<ICAO>_GHCNh_<startYr>_<endYr>.psv`, matching the
+#     file AERMET.R's `download_ghcnh()` produces, so downloads are drop-in.
+#
+# Run:  shiny::runApp("ASOS_Met_Gather_Shiny.R")   (or open in RStudio, Run App)
+# =============================================================================
+
 library(shiny)
 library(httr)
 library(leaflet)
-library(R.utils) # For gunzip
 library(dplyr)
-library(readr) # For read_fwf
-library(stringr) # For str_trim
-library(shinyjs) # For shinyjs::delay and other UI interactions
+library(readr)
+library(stringr)
+library(shinyjs)
 
-# --- Helper function to parse MASTER-STN-HIST.TXT ---
-fetch_and_parse_stations <- function() {
-  station_history_url <- "https://www1.ncdc.noaa.gov/pub/data/inventories/MASTER-STN-HIST.TXT"
-  
-  col_positions <- fwf_positions(
-    start = c(13,  23,  29,  46,  51,  72, 174, 183, 192, 193, 196, 199, 202, 203, 207, 210, 245),
-    end   = c(18,  27,  33,  49,  70,  73, 181, 190, 192, 194, 197, 200, 202, 205, 208, 211, 294),
-    col_names = c("USAF_COOP", "WBAN_NCDC", "WMO_ID", "ICAO", "COUNTRY_NAME", "STATE", "BEGIN_DATE", "END_DATE",
-                  "LAT_DIR", "LAT_DEG", "LAT_MIN", "LAT_SEC",
-                  "LON_DIR", "LON_DEG", "LON_MIN", "LON_SEC",
-                  "STATION_TYPES")
-  )
-  
-  response <- tryCatch({
-    httr::GET(station_history_url, timeout(60))
-  }, error = function(e) {
-    showNotification(paste("Network error fetching station list URL:", e$message), type = "error", duration = NULL)
-    return(NULL)
-  })
-  
-  if (is.null(response)) return(NULL)
-  
-  if (httr::status_code(response) != 200) {
-    showNotification(paste("Failed to download station list. HTTP Status:", httr::status_code(response)), type = "error", duration = NULL)
-    return(NULL)
-  }
-  
-  file_content_text <- httr::content(response, "text", encoding = "UTF-8")
-  if (is.null(file_content_text) || nchar(file_content_text) == 0) {
-    showNotification("Downloaded station list file content is empty.", type = "error", duration = NULL)
-    return(NULL)
-  }
-  
-  stations_raw <- tryCatch({
-    readr::read_fwf(file_content_text, col_positions = col_positions, skip = 1,
-                    guess_max = 20000, 
-                    col_types = readr::cols(.default = "c"),
-                    progress = FALSE)
-  }, error = function(e) {
-    showNotification(paste("Error parsing station list file content:", e$message), type = "error", duration = NULL)
-    return(NULL)
-  })
-  
-  if (is.null(stations_raw) || nrow(stations_raw) == 0) {
-    return(stations_raw) 
-  }
-  
-  parse_lat_lon <- function(dir_char, deg_char, min_char, sec_char, coord_type = "Unknown") {
-    if(!is.character(deg_char) || length(deg_char) != 1) deg_char <- as.character(deg_char[1])
-    if(!is.character(min_char) || length(min_char) != 1) min_char <- as.character(min_char[1])
-    if(!is.character(sec_char) || length(sec_char) != 1) sec_char <- as.character(sec_char[1])
-    if(!is.character(dir_char) || length(dir_char) != 1) dir_char <- as.character(dir_char[1])
-    
-    deg <- suppressWarnings(as.numeric(deg_char))
-    min_val <- suppressWarnings(as.numeric(min_char))
-    sec_val <- suppressWarnings(as.numeric(sec_char))
-    
-    deg[is.na(deg) | deg_char == ""] <- 0
-    min_val[is.na(min_val) | min_char == ""] <- 0
-    sec_val[is.na(sec_val) | sec_char == ""] <- 0
-    
-    value <- deg + min_val/60 + sec_val/3600
-    
-    if (!is.na(dir_char) && dir_char == "-") {
-      value <- -value
-    }
-    if(length(value) != 1 || !is.numeric(value)) {
-      warning(paste("parse_lat_lon for", coord_type, "produced non-numeric or multi-value result for inputs:",
-                    dir_char, deg_char, min_char, sec_char))
-      return(NA_real_)
-    }
-    return(value)
-  }
-  
-  stations_intermediate <- stations_raw %>%
-    mutate_all(str_trim) %>% 
-    filter(END_DATE == "99991231", 
-           str_to_upper(COUNTRY_NAME) == "UNITED STATES", 
-           !is.na(ICAO) & ICAO != "",
-           !is.na(STATE) & STATE != "",
-           !is.na(STATION_TYPES) & str_detect(toupper(STATION_TYPES), "ASOS"),
-           !is.na(WMO_ID) & WMO_ID != "", 
-           !is.na(WBAN_NCDC) & WBAN_NCDC != "" 
-    ) 
-  
-  if (nrow(stations_intermediate) == 0) {
-    showNotification("No suitable ASOS stations with WMO & WBAN IDs found after initial filtering.", type = "warning", duration = 7)
-    return(tibble()) 
-  }
-  
-  stations_df <- stations_intermediate %>%
-    rowwise() %>% 
+# --- Sources -----------------------------------------------------------------
+ISD_HISTORY_URL <- "https://www.ncei.noaa.gov/pub/data/noaa/isd-history.csv"
+LOCAL_STATION_FALLBACK <- "ASOS_Stations.csv"   # bundled offline copy (same schema)
+
+URL_BASE_1MIN <- "https://www.ncei.noaa.gov/data/automated-surface-observing-system-one-minute-pg1/access/"
+URL_BASE_5MIN <- "https://www.ncei.noaa.gov/data/automated-surface-observing-system-five-minute/access/"
+GHCNH_BASE    <- "https://www.ncei.noaa.gov/oa/global-historical-climatology-network/hourly/access/by-year"
+
+CURRENT_YEAR <- as.integer(format(Sys.Date(), "%Y"))
+
+# =============================================================================
+# Station list: parse the NCEI ISD-history CSV (falls back to bundled copy)
+# =============================================================================
+# Columns: USAF, WBAN, "STATION NAME", CTRY, STATE, ICAO, LAT, LON, "ELEV(M)",
+#          BEGIN, END  (END is yyyymmdd; active ASOS now show 2025-08-27, the
+#          ISHD retirement date, rather than the old 99991231 sentinel).
+parse_isd_history <- function(raw_csv) {
+  df <- suppressWarnings(readr::read_csv(
+    raw_csv,
+    col_types = readr::cols(.default = "c"),
+    progress = FALSE, show_col_types = FALSE
+  ))
+  names(df) <- toupper(gsub("[^A-Za-z0-9]", "_", names(df)))  # STATION_NAME, ELEV_M_, ...
+  has_name <- "STATION_NAME" %in% names(df)
+
+  df <- df %>%
     mutate(
-      LAT = tryCatch({parse_lat_lon(LAT_DIR, LAT_DEG, LAT_MIN, LAT_SEC, "LAT")}, 
-                     error = function(e) {cat("Error parsing LAT for ICAO:", if_else(exists("ICAO"), ICAO, "UNKNOWN"), "- Error:", e$message, "\n"); NA_real_}),
-      LON = tryCatch({parse_lat_lon(LON_DIR, LON_DEG, LON_MIN, LON_SEC, "LON")}, 
-                     error = function(e) {cat("Error parsing LON for ICAO:", if_else(exists("ICAO"), ICAO, "UNKNOWN"), "- Error:", e$message, "\n"); NA_real_})
+      ICAO  = str_trim(ICAO),
+      WBAN  = str_trim(WBAN),
+      USAF  = str_trim(USAF),
+      STATE = str_trim(STATE),
+      CTRY  = str_trim(CTRY),
+      LAT   = suppressWarnings(as.numeric(LAT)),
+      LON   = suppressWarnings(as.numeric(LON)),
+      END_YR = suppressWarnings(as.integer(substr(END, 1, 4))),
+      STATION_NAME = if (has_name) str_trim(STATION_NAME) else ""
     ) %>%
-    ungroup() %>% 
-    mutate(CTRY = "US", 
-           USAF_COOP_ID = USAF_COOP, 
-           WBAN_ID = WBAN_NCDC 
+    filter(
+      CTRY == "US",
+      !is.na(ICAO), ICAO != "", nchar(ICAO) == 4,
+      !is.na(WBAN), WBAN != "", WBAN != "99999",
+      !is.na(STATE), STATE != "",
+      !is.na(LAT), !is.na(LON), !(LAT == 0 & LON == 0),
+      !is.na(END_YR), END_YR >= (CURRENT_YEAR - 2)   # recently active ASOS
+    )
+
+  # Keep one record per ICAO: the most recently active
+  df %>%
+    arrange(ICAO, desc(END_YR)) %>%
+    distinct(ICAO, .keep_all = TRUE) %>%
+    transmute(
+      ICAO,
+      WBAN_ID = str_pad(WBAN, 5, "left", "0"),
+      USAF_ID = USAF,
+      GHCNH_ID = paste0("USW000", str_pad(WBAN, 5, "left", "0")),
+      STATE,
+      STATION_NAME,
+      LAT, LON
     ) %>%
-    select(ICAO, WMO_ID, WBAN_ID, USAF_COOP_ID, CTRY, STATE, LAT, LON) %>% 
-    filter(!is.na(LAT) & !is.na(LON))
-  
-  if (nrow(stations_df) == 0) {
-    showNotification("All stations filtered out after LAT/LON parsing. Check console for errors.", type = "warning", duration = 10)
-  }
-  
-  stations_df <- stations_df %>%
-    distinct(ICAO, .keep_all = TRUE) 
-  
-  return(stations_df)
+    arrange(STATE, ICAO)
 }
 
-
-# --- ASOS Configuration ---
-url_base_1min <- "https://www.ncei.noaa.gov/data/automated-surface-observing-system-one-minute-pg1/access/"
-url_base_5min <- "https://www.ncei.noaa.gov/data/automated-surface-observing-system-five-minute/access/"
-
-createOutputDirectories <- function(selected_station_icao, selected_year) { # selected_station is ICAO
-  # Main station directory is just the ICAO
-  main_station_dir <- selected_station_icao
-  year_specific_dir <- file.path(main_station_dir, selected_year)
-  
-  station_output_dir_1min <- file.path(year_specific_dir, "asos_data_1min")
-  station_output_dir_5min <- file.path(year_specific_dir, "asos_data_5min")
-  
-  if (!dir.exists(station_output_dir_1min)) {
-    dir.create(station_output_dir_1min, recursive = TRUE, showWarnings = FALSE)
+fetch_and_parse_stations <- function() {
+  # 1) try the live NCEI CSV
+  resp <- tryCatch(httr::GET(ISD_HISTORY_URL, httr::timeout(60)), error = function(e) NULL)
+  if (!is.null(resp) && httr::status_code(resp) == 200) {
+    txt <- httr::content(resp, "text", encoding = "UTF-8")
+    out <- tryCatch(parse_isd_history(txt), error = function(e) NULL)
+    if (!is.null(out) && nrow(out) > 0) return(out)
   }
-  if (!dir.exists(station_output_dir_5min)) {
-    dir.create(station_output_dir_5min, recursive = TRUE, showWarnings = FALSE)
+  # 2) fall back to the bundled CSV shipped with the app
+  if (file.exists(LOCAL_STATION_FALLBACK)) {
+    showNotification("Live NCEI list unavailable - using bundled ASOS_Stations.csv.",
+                     type = "warning", duration = 8)
+    out <- tryCatch(parse_isd_history(readr::read_file(LOCAL_STATION_FALLBACK)),
+                    error = function(e) NULL)
+    if (!is.null(out) && nrow(out) > 0) return(out)
   }
-  # No return needed as paths are constructed directly in download logic, but could be useful
-  # For this structure, main_station_dir is simply selected_station_icao.
+  showNotification("Could not load a station list from NCEI or the local fallback.",
+                   type = "error", duration = NULL)
+  EMPTY_STATIONS
 }
 
-clearDownloadedData_asos <- function(selected_station_icao, selected_start_year, selected_end_year) {
-  cat("Attempting to clear ASOS data for station:", selected_station_icao, 
-      "Years:", selected_start_year, "to", selected_end_year, "\n")
-  main_station_dir <- selected_station_icao
-  cleared_any_asos_data <- FALSE
-  
-  for (year_val in selected_start_year:selected_end_year) {
-    year_char <- as.character(year_val)
-    year_specific_dir <- file.path(main_station_dir, year_char)
-    
-    dir_1min_to_remove <- file.path(year_specific_dir, "asos_data_1min")
-    dir_5min_to_remove <- file.path(year_specific_dir, "asos_data_5min")
-    
-    if (dir.exists(dir_1min_to_remove)) {
-      unlink(dir_1min_to_remove, recursive = TRUE, force = TRUE)
-      cat("Removed:", dir_1min_to_remove, "\n")
-      cleared_any_asos_data <- TRUE
+EMPTY_STATIONS <- tibble(ICAO = character(), WBAN_ID = character(), USAF_ID = character(),
+                         GHCNH_ID = character(), STATE = character(),
+                         STATION_NAME = character(), LAT = numeric(), LON = numeric())
+
+# =============================================================================
+# Clear helpers
+# =============================================================================
+clear_asos_data <- function(icao, y1, y2) {
+  cleared <- FALSE
+  for (yr in y1:y2) {
+    yr_dir <- file.path(icao, as.character(yr))
+    for (sub in c("asos_data_1min", "asos_data_5min")) {
+      d <- file.path(yr_dir, sub)
+      if (dir.exists(d)) { unlink(d, recursive = TRUE, force = TRUE); cleared <- TRUE }
     }
-    if (dir.exists(dir_5min_to_remove)) {
-      unlink(dir_5min_to_remove, recursive = TRUE, force = TRUE)
-      cat("Removed:", dir_5min_to_remove, "\n")
-      cleared_any_asos_data <- TRUE
-    }
-    
-    # If the year-specific directory is now empty, remove it
-    if (dir.exists(year_specific_dir) && 
-        length(list.files(year_specific_dir, recursive = TRUE, all.files = TRUE, no.. = TRUE)) == 0) {
-      unlink(year_specific_dir, recursive = TRUE, force = TRUE)
-      cat("Removed empty year directory for ASOS data:", year_specific_dir, "\n")
+    if (dir.exists(yr_dir) &&
+        length(list.files(yr_dir, recursive = TRUE, all.files = TRUE, no.. = TRUE)) == 0) {
+      unlink(yr_dir, recursive = TRUE, force = TRUE)
     }
   }
-  
-  # After clearing specific ASOS data, check if the main station directory is empty
-  # (e.g., if ISH data was also cleared or never downloaded)
-  if (dir.exists(main_station_dir) && 
-      length(list.files(main_station_dir, recursive = TRUE, all.files = TRUE, no.. = TRUE)) == 0) {
-    unlink(main_station_dir, recursive = TRUE, force = TRUE)
-    cat("Removed empty main station directory after clearing ASOS data:", main_station_dir, "\n")
+  if (dir.exists(icao) &&
+      length(list.files(icao, recursive = TRUE, all.files = TRUE, no.. = TRUE)) == 0) {
+    unlink(icao, recursive = TRUE, force = TRUE)
   }
-  
-  if (cleared_any_asos_data) {
-    return(paste("ASOS data cleared for station", selected_station_icao, "for years", selected_start_year, "to", selected_end_year))
+  if (cleared) paste("Cleared ASOS data for", icao, "years", y1, "to", y2)
+  else paste("No ASOS data found to clear for", icao, "years", y1, "to", y2)
+}
+
+clear_ghcnh_data <- function(icao) {
+  d <- file.path(icao, "ghcnh_data")
+  if (dir.exists(d)) {
+    unlink(d, recursive = TRUE, force = TRUE)
+    if (dir.exists(icao) &&
+        length(list.files(icao, recursive = TRUE, all.files = TRUE, no.. = TRUE)) == 0) {
+      unlink(icao, recursive = TRUE, force = TRUE)
+    }
+    paste("Cleared GHCNh data for", icao)
   } else {
-    return(paste("No ASOS data found to clear for station", selected_station_icao, "for years", selected_start_year, "to", selected_end_year))
+    paste("No GHCNh data directory found for", icao)
   }
 }
 
+# =============================================================================
+# UI modules
+# =============================================================================
+station_map <- function(ns, map_id) leafletOutput(ns(map_id), height = "300px")
 
-# --- ISH Configuration ---
-clearDownloadedData_ish <- function(selected_icao_for_ish) { 
-  main_station_dir <- selected_icao_for_ish
-  ish_data_specific_dir_to_clear <- file.path(main_station_dir, "ish_gz_data")
-  
-  cat("Attempting to clear ISH (.gz) data from directory:", ish_data_specific_dir_to_clear, "\n")
-  
-  if (dir.exists(ish_data_specific_dir_to_clear)) {
-    unlink(ish_data_specific_dir_to_clear, recursive = TRUE, force = TRUE)
-    cat("Removed ISH (.gz) data directory:", ish_data_specific_dir_to_clear, "\n")
-    
-    if (dir.exists(main_station_dir) && 
-        length(list.files(main_station_dir, recursive = TRUE, all.files = TRUE, no.. = TRUE)) == 0) {
-      unlink(main_station_dir, recursive = TRUE, force = TRUE)
-      cat("Removed empty main station directory after clearing ISH data:", main_station_dir, "\n")
-    }
-    return(paste("Cleared ISH (.gz) data for station", selected_icao_for_ish))
-  } else {
-    return(paste("No ISH (.gz) data directory found at", ish_data_specific_dir_to_clear, "for station", selected_icao_for_ish))
-  }
-}
-
-# --- UI Definitions ---
-asos_ui_module <- function(id) {
+asos_ui <- function(id) {
   ns <- NS(id)
-  fluidPage(
-    sidebarLayout(
-      sidebarPanel(
-        selectInput(ns("state_asos"), "Filter by State", choices = NULL, selectize = FALSE),
-        leafletOutput(ns("map_asos"), height = "300px"), 
-        selectizeInput(ns("station_asos"), "Select ASOS Station (by ICAO)", choices = NULL),
-        sliderInput(ns("start_year_asos"), "Start Year", min = 2000, max = as.integer(format(Sys.Date(), "%Y")) -1, value = as.integer(format(Sys.Date(), "%Y")) - 3, step = 1, sep = ""),
-        sliderInput(ns("end_year_asos"), "End Year", min = 2000, max = as.integer(format(Sys.Date(), "%Y"))-1, value = as.integer(format(Sys.Date(), "%Y")) - 2, step = 1, sep = ""),
-        actionButton(ns("downloadButton_asos"), "Download ASOS Data", class = "btn-primary"),
-        actionButton(ns("clearDataButton_asos"), "Clear Downloaded ASOS Data", class = "btn-danger")
-      ),
-      mainPanel(
-        textOutput(ns("status_asos"))
-      )
-    )
-  )
+  fluidPage(sidebarLayout(
+    sidebarPanel(
+      helpText("1-minute & 5-minute ASOS observations (feed AERMINUTE for hourly winds/calms)."),
+      selectInput(ns("state"), "Filter by State", choices = NULL, selectize = FALSE),
+      station_map(ns, "map"),
+      selectizeInput(ns("station"), "Select ASOS Station (ICAO)", choices = NULL),
+      sliderInput(ns("y1"), "Start Year", min = 2000, max = CURRENT_YEAR,
+                  value = CURRENT_YEAR - 5, step = 1, sep = ""),
+      sliderInput(ns("y2"), "End Year", min = 2000, max = CURRENT_YEAR,
+                  value = CURRENT_YEAR - 1, step = 1, sep = ""),
+      actionButton(ns("download"), "Download ASOS Data", class = "btn-primary"),
+      actionButton(ns("clear"), "Clear Downloaded ASOS Data", class = "btn-danger")
+    ),
+    mainPanel(verbatimTextOutput(ns("status")))
+  ))
 }
 
-ish_ui_module <- function(id) {
+ghcnh_ui <- function(id) {
   ns <- NS(id)
-  fluidPage(
-    sidebarLayout(
-      sidebarPanel(
-        selectInput(ns("state_ish"), "Filter by State", choices = NULL, selectize = FALSE),
-        leafletOutput(ns("map_ish"), height = "300px"), 
-        selectizeInput(ns("station_ish"), "Select ISH Station (by ICAO)", choices = NULL),
-        sliderInput(ns("start_year_ish"), "Start Year", min = 1990, max = as.integer(format(Sys.Date(), "%Y"))-1, value = as.integer(format(Sys.Date(), "%Y")) - 3, step = 1, sep = ""),
-        sliderInput(ns("end_year_ish"), "End Year", min = 1990, max = as.integer(format(Sys.Date(), "%Y"))-1, value = as.integer(format(Sys.Date(), "%Y")) - 2, step = 1, sep = ""),
-        actionButton(ns("downloadButton_ish"), "Download ISH Data (.gz format)", class = "btn-primary"),
-        actionButton(ns("clearDataButton_ish"), "Clear Downloaded ISH Data", class = "btn-danger")
-      ),
-      mainPanel(
-        textOutput(ns("status_ish"))
-      )
-    )
-  )
+  fluidPage(sidebarLayout(
+    sidebarPanel(
+      helpText("GHCNh hourly surface data (.psv) - the NCEI replacement for the retired ",
+               "ISHD/DS3505 archive. Output feeds AERMET Stage 1."),
+      selectInput(ns("state"), "Filter by State", choices = NULL, selectize = FALSE),
+      station_map(ns, "map"),
+      selectizeInput(ns("station"), "Select Station (ICAO)", choices = NULL),
+      sliderInput(ns("y1"), "Start Year", min = 2000, max = CURRENT_YEAR,
+                  value = CURRENT_YEAR - 5, step = 1, sep = ""),
+      sliderInput(ns("y2"), "End Year", min = 2000, max = CURRENT_YEAR,
+                  value = CURRENT_YEAR - 1, step = 1, sep = ""),
+      actionButton(ns("download"), "Download GHCNh Data (.psv)", class = "btn-primary"),
+      actionButton(ns("clear"), "Clear Downloaded GHCNh Data", class = "btn-danger")
+    ),
+    mainPanel(verbatimTextOutput(ns("status")))
+  ))
 }
 
-# --- Server Logic Modules ---
-asos_server_module <- function(id, ASOS_Stations_df_reactive) {
+# =============================================================================
+# Shared server helper: state filter + station dropdown + leaflet map
+# =============================================================================
+wire_state_and_map <- function(input, output, session, stations, map_id, station_id) {
+  states <- reactive({
+    df <- stations(); if (nrow(df)) sort(unique(df$STATE)) else character(0)
+  })
+  observe({
+    ch <- states()
+    sel <- if ("MS" %in% ch) "MS" else if (length(ch)) ch[1] else NULL
+    updateSelectInput(session, "state", choices = ch, selected = sel)
+  })
+  in_state <- reactive({
+    req(stations(), input$state)
+    filter(stations(), STATE == input$state)
+  })
+  observe({
+    df <- in_state()
+    choices <- if (nrow(df)) setNames(df$ICAO,
+                 paste0(df$ICAO, " - ", df$STATION_NAME)) else character(0)
+    updateSelectizeInput(session, "station", choices = choices,
+                         selected = if (length(choices)) choices[[1]] else NULL, server = TRUE)
+  })
+  output[[map_id]] <- renderLeaflet({
+    df <- in_state()
+    if (!nrow(df))
+      return(leaflet() %>% addTiles() %>% setView(-98.583, 39.833, zoom = 3))
+    leaflet(df) %>% addTiles() %>%
+      addMarkers(~LON, ~LAT, label = ~paste0(ICAO, " - ", STATION_NAME), layerId = ~ICAO) %>%
+      setView(mean(df$LON), mean(df$LAT), zoom = 6)
+  })
+  observeEvent(input[[paste0(map_id, "_marker_click")]], {
+    ev <- input[[paste0(map_id, "_marker_click")]]
+    req(ev$id); updateSelectizeInput(session, "station", selected = ev$id)
+  })
+  in_state
+}
+
+# =============================================================================
+# ASOS server
+# =============================================================================
+asos_server <- function(id, stations) {
   moduleServer(id, function(input, output, session) {
-    ns <- session$ns
-    
-    available_states_asos <- reactive({
-      req(ASOS_Stations_df_reactive())
-      df <- ASOS_Stations_df_reactive()
-      if(!is.null(df) && nrow(df) > 0 && "STATE" %in% names(df)) {
-        sort(unique(df$STATE))
-      } else {
-        character(0)
-      }
-    })
-    
-    observe({
-      states_choices <- available_states_asos()
-      updateSelectInput(session, "state_asos", choices = states_choices, selected = if(length(states_choices) > 0) states_choices[1] else NULL)
-    })
-    
-    asos_data_filtered_by_state <- reactive({
-      req(ASOS_Stations_df_reactive(), input$state_asos)
-      df <- ASOS_Stations_df_reactive()
-      filter(df, STATE == input$state_asos, !is.na(ICAO) & ICAO != "")
-    })
-    
-    observe({
-      df_stations <- asos_data_filtered_by_state()
-      stations_in_state <- character(0)
-      if(nrow(df_stations) > 0) {
-        stations_in_state <- sort(unique(df_stations$ICAO))
-      }
-      updateSelectizeInput(session, "station_asos", choices = stations_in_state, 
-                           selected = if(length(stations_in_state)>0) stations_in_state[1] else NULL, 
-                           server = TRUE)
-    })
-    
-    output$map_asos <- renderLeaflet({
-      df_map_data <- asos_data_filtered_by_state()
-      if (is.null(df_map_data) || nrow(df_map_data) == 0) {
-        return(leaflet() %>% addTiles() %>% setView(lng = -98.583333, lat = 39.833333, zoom = 3)) 
-      }
-      leaflet(data = df_map_data) %>%
-        addTiles() %>%
-        addMarkers(
-          lat = ~LAT, lng = ~LON, label = ~ICAO, layerId = ~ICAO
-        ) %>% setView(lng = mean(df_map_data$LON, na.rm = TRUE), lat = mean(df_map_data$LAT, na.rm = TRUE), zoom = 6)
-    })
-    
-    observeEvent(input$map_asos_marker_click, {
-      event <- input$map_asos_marker_click
-      req(event$id)
-      updateSelectizeInput(session, "station_asos", selected = event$id)
-    })
-    
-    observeEvent(input$downloadButton_asos, {
-      req(input$station_asos, input$start_year_asos, input$end_year_asos, input$station_asos != "")
-      selected_station_icao <- input$station_asos # This is the ICAO code
-      selected_start_year <- input$start_year_asos
-      selected_end_year <- input$end_year_asos
-      
-      output$status_asos <- renderText(paste("Starting ASOS download for station", selected_station_icao, "..."))
-      
-      # Main station directory is simply the ICAO
-      main_station_dir <- selected_station_icao
-      
-      total_ops <- (selected_end_year - selected_start_year + 1) * 12 * 2 
-      
-      withProgress(message = 'Downloading ASOS Data', value = 0, {
-        op_count <- 0
-        for (year in selected_start_year:selected_end_year) {
-          # ASOS data goes into ICAO/YEAR/asos_data_type
-          year_specific_dir <- file.path(main_station_dir, as.character(year))
-          output_dir_1min <- file.path(year_specific_dir, "asos_data_1min")
-          output_dir_5min <- file.path(year_specific_dir, "asos_data_5min")
-          
-          if (!dir.exists(output_dir_1min)) dir.create(output_dir_1min, recursive = TRUE, showWarnings = FALSE)
-          if (!dir.exists(output_dir_5min)) dir.create(output_dir_5min, recursive = TRUE, showWarnings = FALSE)
-          
-          for (month in 1:12) {
-            op_count <- op_count + 1 
-            incProgress(1/total_ops, detail = paste("1-min: Yr", year, "Mo", sprintf("%02d", month)))
-            
-            url_1min <- paste0(url_base_1min, year, "/", sprintf("%02d", month), "/asos-1min-pg1-", selected_station_icao, "-", year, sprintf("%02d", month), ".dat")
-            file_name_1min <- paste0(selected_station_icao, "_", year, sprintf("%02d", month), "_1min.dat")
-            file_path_1min <- file.path(output_dir_1min, file_name_1min)
-            
-            tryCatch({
-              response_1min <- GET(url_1min, timeout(30))
-              if (status_code(response_1min) == 200) {
-                writeBin(content(response_1min, "raw"), file_path_1min)
-                cat("1-min data: ", selected_station_icao, year, month, "saved.\n")
-              } else {
-                cat("Failed 1-min: ", selected_station_icao, year, month, "Status:", status_code(response_1min), "URL:", url_1min, "\n")
-                stop_for_status(response_1min, task = paste("download 1-min data"))
-              }
-            }, error = function(e) {
-              cat("Error 1-min: ", selected_station_icao, year, month, ":", e$message, "\n")
-              output$status_asos <- renderText(paste("Error (1-min) Yr", year, "Mo", month)) 
-            })
-            
-            op_count <- op_count + 1 
-            incProgress(1/total_ops, detail = paste("5-min: Yr", year, "Mo", sprintf("%02d", month)))
-            
-            url_5min <- paste0(url_base_5min, year, "/", sprintf("%02d", month), "/asos-5min-", selected_station_icao, "-", year, sprintf("%02d", month), ".dat")
-            file_name_5min <- paste0(selected_station_icao, "_", year, sprintf("%02d", month), "_5min.dat")
-            file_path_5min <- file.path(output_dir_5min, file_name_5min)
-            
-            tryCatch({
-              response_5min <- GET(url_5min, timeout(30))
-              if (status_code(response_5min) == 200) {
-                writeBin(content(response_5min, "raw"), file_path_5min)
-                cat("5-min data: ", selected_station_icao, year, month, "saved.\n")
-              } else {
-                cat("Failed 5-min: ", selected_station_icao, year, month, "Status:", status_code(response_5min), "URL:", url_5min, "\n")
-                stop_for_status(response_5min, task = paste("download 5-min data"))
-              }
-            }, error = function(e) {
-              cat("Error 5-min: ", selected_station_icao, year, month, ":", e$message, "\n")
-              output$status_asos <- renderText(paste("Error (5-min) Yr", year, "Mo", month))
-            })
+    wire_state_and_map(input, output, session, stations, "map", "station")
+
+    observeEvent(input$download, {
+      req(input$station, input$station != "")
+      icao <- input$station; y1 <- input$y1; y2 <- min(input$y2, CURRENT_YEAR)
+      if (y2 < y1) { output$status <- renderText("End year must be >= start year."); return() }
+      log <- c(paste0("ASOS download: ", icao, "  ", y1, "-", y2), "")
+      output$status <- renderText(paste(log, collapse = "\n"))
+
+      total <- (y2 - y1 + 1) * 12 * 2; ok1 <- 0; ok5 <- 0
+      withProgress(message = paste("Downloading ASOS", icao), value = 0, {
+        for (yr in y1:y2) {
+          d1 <- file.path(icao, yr, "asos_data_1min")
+          d5 <- file.path(icao, yr, "asos_data_5min")
+          dir.create(d1, recursive = TRUE, showWarnings = FALSE)
+          dir.create(d5, recursive = TRUE, showWarnings = FALSE)
+          for (mo in 1:12) {
+            mm <- sprintf("%02d", mo)
+            incProgress(1/total, detail = paste("1-min", yr, mm))
+            u1 <- paste0(URL_BASE_1MIN, yr, "/", mm, "/asos-1min-pg1-", icao, "-", yr, mm, ".dat")
+            r1 <- tryCatch(GET(u1, timeout(60)), error = function(e) NULL)
+            if (!is.null(r1) && status_code(r1) == 200) {
+              writeBin(content(r1, "raw"), file.path(d1, paste0(icao, "_", yr, mm, "_1min.dat"))); ok1 <- ok1 + 1
+            }
+            incProgress(1/total, detail = paste("5-min", yr, mm))
+            u5 <- paste0(URL_BASE_5MIN, yr, "/", mm, "/asos-5min-", icao, "-", yr, mm, ".dat")
+            r5 <- tryCatch(GET(u5, timeout(60)), error = function(e) NULL)
+            if (!is.null(r5) && status_code(r5) == 200) {
+              writeBin(content(r5, "raw"), file.path(d5, paste0(icao, "_", yr, mm, "_5min.dat"))); ok5 <- ok5 + 1
+            }
           }
         }
       })
-      output$status_asos <- renderText(paste("ASOS download process completed for station", selected_station_icao,". Check console for details."))
+      log <- c(log,
+               paste0("Saved ", ok1, " one-minute and ", ok5, " five-minute monthly files."),
+               paste0("Location: ", normalizePath(icao, mustWork = FALSE)),
+               if (ok1 + ok5 == 0) "No files returned - check ICAO/years (some sites lack 1-min data)." else "Done.")
+      output$status <- renderText(paste(log, collapse = "\n"))
     })
-    
-    observeEvent(input$clearDataButton_asos, {
-      req(input$station_asos, input$start_year_asos, input$end_year_asos, input$station_asos != "")
-      msg <- clearDownloadedData_asos(input$station_asos, input$start_year_asos, input$end_year_asos)
-      output$status_asos <- renderText(msg)
+
+    observeEvent(input$clear, {
+      req(input$station, input$station != "")
+      output$status <- renderText(clear_asos_data(input$station, input$y1, input$y2))
     })
   })
 }
 
-ish_server_module <- function(id, ASOS_Stations_df_reactive) {
+# =============================================================================
+# GHCNh server  (replaces the retired ISH/DS3505 downloader)
+# =============================================================================
+ghcnh_server <- function(id, stations) {
   moduleServer(id, function(input, output, session) {
-    ns <- session$ns
-    
-    available_states_ish <- reactive({
-      req(ASOS_Stations_df_reactive())
-      df <- ASOS_Stations_df_reactive()
-      if(!is.null(df) && nrow(df) > 0 && "STATE" %in% names(df)) {
-        sort(unique(df$STATE))
-      } else {
-        character(0)
+    wire_state_and_map(input, output, session, stations, "map", "station")
+
+    observeEvent(input$download, {
+      req(input$station, input$station != "")
+      icao <- input$station; y1 <- input$y1; y2 <- min(input$y2, CURRENT_YEAR)
+      if (y2 < y1) { output$status <- renderText("End year must be >= start year."); return() }
+
+      info <- filter(stations(), ICAO == icao) %>% slice(1)
+      if (!nrow(info) || is.na(info$GHCNH_ID) || info$GHCNH_ID == "") {
+        output$status <- renderText(paste("No GHCNh id (USW000+WBAN) available for", icao)); return()
       }
-    })
-    
-    observe({
-      states_choices <- available_states_ish()
-      updateSelectInput(session, "state_ish", choices = states_choices, selected = if(length(states_choices) > 0) states_choices[1] else NULL)
-    })
-    
-    ish_data_filtered_by_state <- reactive({
-      req(ASOS_Stations_df_reactive(), input$state_ish)
-      df <- ASOS_Stations_df_reactive()
-      filter(df, STATE == input$state_ish) 
-    })
-    
-    observe({ 
-      df_stations <- ish_data_filtered_by_state()
-      stations_choices_list <- list() 
-      if(nrow(df_stations) > 0) {
-        df_stations <- df_stations %>%
-          mutate(
-            Padded_WBAN_ID = sprintf("%05s", WBAN_ID),
-            Modified_WMO_ID = if_else(nchar(WMO_ID) == 5, paste0(WMO_ID, "0"), WMO_ID),
-            ISH_DISPLAY_LABEL = paste(ICAO, paste0("(", Modified_WMO_ID, "-", Padded_WBAN_ID, ")"))
-          )
-        stations_choices_list <- setNames(as.list(df_stations$ICAO), df_stations$ISH_DISPLAY_LABEL)
-      }
-      updateSelectizeInput(session, "station_ish", choices = stations_choices_list, 
-                           selected = if(length(stations_choices_list)>0) stations_choices_list[[1]] else NULL, 
-                           server = TRUE)
-    })
-    
-    output$map_ish <- renderLeaflet({
-      df_map_data <- ish_data_filtered_by_state()
-      if (is.null(df_map_data) || nrow(df_map_data) == 0) {
-        return(leaflet() %>% addTiles() %>% setView(lng = -98.583333, lat = 39.833333, zoom = 3))
-      }
-      leaflet(data = df_map_data) %>%
-        addTiles() %>%
-        addMarkers(
-          lat = ~LAT, lng = ~LON, label = ~ICAO, layerId = ~ICAO 
-        ) %>% setView(lng = mean(df_map_data$LON, na.rm = TRUE), lat = mean(df_map_data$LAT, na.rm = TRUE), zoom = 6)
-    })
-    
-    observeEvent(input$map_ish_marker_click, {
-      event <- input$map_ish_marker_click
-      req(event$id) 
-      updateSelectizeInput(session, "station_ish", selected = event$id)
-    })
-    
-    observeEvent(input$downloadButton_ish, {
-      req(input$station_ish, input$start_year_ish, input$end_year_ish, input$station_ish != "")
-      
-      selected_icao_for_ish <- input$station_ish 
-      start_year <- input$start_year_ish
-      end_year <- input$end_year_ish
-      
-      station_info <- ASOS_Stations_df_reactive() %>% 
-        filter(ICAO == selected_icao_for_ish) %>% 
-        slice(1) 
-      
-      if(nrow(station_info) == 0 || is.na(station_info$WMO_ID) || is.na(station_info$WBAN_ID)) {
-        output$status_ish <- renderText(paste("Could not find required WMO/WBAN ID for selected ICAO:", selected_icao_for_ish))
-        return()
-      }
-      
-      effective_wmo_id <- station_info$WMO_ID
-      if (nchar(effective_wmo_id) == 5) { 
-        effective_wmo_id <- paste0(effective_wmo_id, "0")
-      }
-      padded_wban_id <- sprintf("%05s", station_info$WBAN_ID)
-      station_file_id_prefix <- paste(effective_wmo_id, padded_wban_id, sep = "-") 
-      
-      output$status_ish <- renderText(paste("Starting ISH (.gz format) download for ICAO", selected_icao_for_ish, 
-                                            "(using ID", station_file_id_prefix, ")..."))
-      
-      main_station_output_dir <- selected_icao_for_ish 
-      ish_data_specific_dir <- file.path(main_station_output_dir, "ish_gz_data") 
-      
-      if (!dir.exists(ish_data_specific_dir)) {
-        dir.create(ish_data_specific_dir, showWarnings = FALSE, recursive = TRUE)
-        cat("Created ISH data directory:", ish_data_specific_dir, "\n")
-      }
-      
-      combined_file_name <- paste0(selected_icao_for_ish, "_", station_file_id_prefix, "_", start_year, "_", end_year, "_combined.ish")
-      combined_file_path <- file.path(ish_data_specific_dir, combined_file_name) 
-      
-      if (file.exists(combined_file_path)) {
-        file.remove(combined_file_path) 
-        cat("Removed existing combined ISH file:", combined_file_path, "\n")
-      }
-      
-      years_to_download <- start_year:end_year
-      total_years <- length(years_to_download)
-      all_downloads_successful <- TRUE
-      
-      withProgress(message = 'Downloading ISH (.gz) Data', value = 0, {
-        for (i in seq_along(years_to_download)) {
-          year <- years_to_download[i]
-          incProgress(1/total_years, detail = paste("Year:", year))
-          
-          file_on_server <- paste0(station_file_id_prefix, "-", year, ".gz")
-          ish_url <- paste0("https://www1.ncdc.noaa.gov/pub/data/noaa/", year, "/", file_on_server)
-          
-          temp_gz_filename <- file.path(ish_data_specific_dir, file_on_server)
-          temp_unzipped_filename <- file.path(ish_data_specific_dir, gsub(".gz$", ".txt", file_on_server))
-          
-          download_success_this_year <- FALSE
-          tryCatch({
-            response <- GET(ish_url, timeout(90), write_disk(temp_gz_filename, overwrite = TRUE))
-            if (status_code(response) == 200) {
-              cat("Downloaded:", temp_gz_filename, "from URL:", ish_url, "\n")
-              R.utils::gunzip(temp_gz_filename, destname = temp_unzipped_filename, overwrite = TRUE, remove = FALSE) 
-              cat("Unzipped to:", temp_unzipped_filename, "\n")
-              data_content_lines <- readLines(temp_unzipped_filename)
-              write(data_content_lines, combined_file_path, append = TRUE)
-              cat("Appended data for", year, "to", combined_file_path, "\n")
-              if(file.exists(temp_unzipped_filename)) file.remove(temp_unzipped_filename)
-              if(file.exists(temp_gz_filename)) file.remove(temp_gz_filename)
-              download_success_this_year <- TRUE
-            } else {
-              cat("Failed ISH download: ", selected_icao_for_ish, year, "Status:", status_code(response), "URL:", ish_url, "\n")
-              stop_for_status(response, task = paste("download ISH .gz data from", ish_url))
-            }
-          }, error = function(e) {
-            all_downloads_successful <- FALSE 
-            cat("Error ISH .gz: ", selected_icao_for_ish, year, "URL:", ish_url, ":", e$message, "\n")
-            output$status_ish <- renderText(paste("Error ISH .gz Yr", year, "(Check console)"))
-            if (file.exists(temp_gz_filename)) file.remove(temp_gz_filename)
-            if (file.exists(temp_unzipped_filename)) file.remove(temp_unzipped_filename)
-          })
+      ghcn_id <- info$GHCNH_ID
+      out_dir <- file.path(icao, "ghcnh_data")
+      dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+      out_file <- file.path(out_dir, sprintf("%s_GHCNh_%d_%d.psv", icao, y1, y2))
+      if (file.exists(out_file)) file.remove(out_file)
+
+      log <- c(paste0("GHCNh download: ", icao, " (", ghcn_id, ")  ", y1, "-", y2), "")
+      output$status <- renderText(paste(log, collapse = "\n"))
+
+      years <- y1:y2; got <- character(0); missed <- character(0); header_written <- FALSE
+      old_to <- getOption("timeout"); options(timeout = 900); on.exit(options(timeout = old_to))
+      withProgress(message = paste("Downloading GHCNh", icao), value = 0, {
+        for (yr in years) {
+          incProgress(1/length(years), detail = paste("Year", yr))
+          url <- sprintf("%s/%d/psv/GHCNh_%s_%d.psv", GHCNH_BASE, yr, ghcn_id, yr)
+          tmp <- file.path(out_dir, sprintf("_tmp_%d.psv", yr))
+          r <- tryCatch(GET(url, timeout(300), write_disk(tmp, overwrite = TRUE)),
+                        error = function(e) NULL)
+          if (!is.null(r) && status_code(r) == 200 && file.exists(tmp) && file.info(tmp)$size > 1000) {
+            ln <- readLines(tmp, warn = FALSE)
+            if (!header_written) { writeLines(ln, out_file); header_written <- TRUE }
+            else write(ln[-1], out_file, append = TRUE)
+            got <- c(got, as.character(yr))
+          } else {
+            missed <- c(missed, as.character(yr))
+          }
+          if (file.exists(tmp)) file.remove(tmp)
         }
       })
-      if(all_downloads_successful && file.exists(combined_file_path) && file.info(combined_file_path)$size > 0) { 
-        output$status_ish <- renderText(paste("ISH (.gz) download completed. Combined file:", combined_file_path))
-      } else if (file.exists(combined_file_path) && file.info(combined_file_path)$size > 0) {
-        output$status_ish <- renderText(paste("ISH (.gz) download had some issues. Partial combined file created:", combined_file_path, ". Check console."))
+
+      if (length(got)) {
+        log <- c(log,
+                 paste0("Combined file: ", normalizePath(out_file, mustWork = FALSE)),
+                 paste0("Years included: ", paste(got, collapse = ", ")),
+                 if (length(missed)) paste0("No GHCNh data for: ", paste(missed, collapse = ", ")) else NULL,
+                 "", "This .psv matches AERMET.R's download_ghcnh() output and can be used directly as SURFDATA.")
       } else {
-        output$status_ish <- renderText(paste("ISH (.gz) download failed or produced no data. Check console for details."))
+        log <- c(log, paste0("No GHCNh data returned for any year. ",
+                             "Verify the station is a USW-type ASOS (id ", ghcn_id, ")."))
       }
+      output$status <- renderText(paste(log, collapse = "\n"))
     })
-    
-    observeEvent(input$clearDataButton_ish, {
-      req(input$station_ish, input$station_ish != "") 
-      msg <- clearDownloadedData_ish(input$station_ish) 
-      output$status_ish <- renderText(msg)
+
+    observeEvent(input$clear, {
+      req(input$station, input$station != "")
+      output$status <- renderText(clear_ghcnh_data(input$station))
     })
   })
 }
 
-# --- Main App UI and Server ---
+# =============================================================================
+# App
+# =============================================================================
 ui <- fluidPage(
-  useShinyjs(), 
-  tags$head(
-    tags$style(HTML("
-      .btn-primary { background-color: #007bff; border-color: #007bff; color: white; }
-      .btn-danger { background-color: #dc3545; border-color: #dc3545; color: white; }
-    "))
-  ),
-  titlePanel("AERMET NOAA Data Downloaders"),
-  p(id="station_load_status_text", "Initializing..."), 
+  useShinyjs(),
+  tags$head(tags$style(HTML("
+    .btn-primary { background-color:#005ea2; border-color:#005ea2; color:#fff; }
+    .btn-danger  { background-color:#b50909; border-color:#b50909; color:#fff; }
+    #load_status { font-weight:600; color:#005ea2; }
+  "))),
+  titlePanel("AERMET NOAA Data Downloader - ASOS 1/5-min + GHCNh"),
+  p(id = "load_status", "Initializing..."),
   tabsetPanel(
-    id = "main_tabs", 
-    tabPanel("ASOS Data", asos_ui_module("asos_tab")),
-    tabPanel("ISH Data", ish_ui_module("ish_tab"))
-  )
+    id = "tabs",
+    tabPanel("ASOS 1/5-min Winds", asos_ui("asos")),
+    tabPanel("GHCNh Surface", ghcnh_ui("ghcnh"))
+  ),
+  tags$hr(),
+  tags$small(HTML(paste0(
+    "Surface: <b>GHCNh</b> (NCEI) replaces the retired ISHD/DS3505 archive (Aug 2025). ",
+    "Winds: <b>1-minute ASOS</b> via AERMINUTE. Station metadata: NCEI isd-history.csv. ",
+    "Companion to the MDEQ <b>AERMET.R</b> pipeline."
+  )))
 )
 
 server <- function(input, output, session) {
-  ASOS_Stations_df_reactive <- reactiveVal(
-    tibble(ICAO = character(), WMO_ID = character(), WBAN_ID = character(), USAF_COOP_ID = character(),
-           CTRY = character(), STATE = character(), LAT = numeric(), LON = numeric())
-  )
-  
+  stations <- reactiveVal(EMPTY_STATIONS)
+
   isolate({
-    shinyjs::html("station_load_status_text", "Fetching station list from NOAA, please wait...")
-    showModal(modalDialog(
-      title = "Loading Station Data",
-      "Fetching and processing the master station list from NOAA. This may take a minute or two...",
-      easyClose = FALSE, footer = NULL
-    ))
-    
-    stations <- tryCatch({
-      fetch_and_parse_stations()
-    }, error = function(e) {
-      showNotification(paste("Critical error during fetch_and_parse_stations MAIN execution:", e$message), type="error", duration=NULL)
-      NULL
-    })
-    
-    removeModal() 
-    
-    if(!is.null(stations) && nrow(stations) > 0) {
-      ASOS_Stations_df_reactive(stations)
-      shinyjs::html("station_load_status_text", paste("Station list loaded with", nrow(stations), "ASOS stations suitable for download."))
-      shinyjs::delay(200, showNotification("Station list loaded successfully.", type = "message", duration = 5))
+    shinyjs::html("load_status", "Fetching station list from NCEI, please wait...")
+    showModal(modalDialog(title = "Loading Station Data",
+      "Fetching and filtering the NCEI ISD-history station list...",
+      easyClose = FALSE, footer = NULL))
+    s <- tryCatch(fetch_and_parse_stations(), error = function(e) NULL)
+    removeModal()
+    if (!is.null(s) && nrow(s) > 0) {
+      stations(s)
+      shinyjs::html("load_status", paste0("Loaded ", nrow(s), " active US ASOS stations."))
     } else {
-      ASOS_Stations_df_reactive(
-        tibble(ICAO = character(), WMO_ID = character(), WBAN_ID = character(), USAF_COOP_ID = character(),
-               CTRY = character(), STATE = character(), LAT = numeric(), LON = numeric())
-      )
-      shinyjs::html("station_load_status_text", "ERROR: Failed to load/parse station list, or no suitable stations found. App functionality may be limited. Check console/notifications.")
-      shinyjs::delay(200,showNotification("Station list is empty, could not be parsed, or no stations matched all criteria. Some features may not work.", type = "warning", duration = NULL))
+      stations(EMPTY_STATIONS)
+      shinyjs::html("load_status", "ERROR: could not load a station list. Check network / bundled CSV.")
     }
   })
-  
-  asos_server_module("asos_tab", ASOS_Stations_df_reactive)
-  ish_server_module("ish_tab", ASOS_Stations_df_reactive)
+
+  asos_server("asos", stations)
+  ghcnh_server("ghcnh", stations)
 }
 
 shinyApp(ui, server)

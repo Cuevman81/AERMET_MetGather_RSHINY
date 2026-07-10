@@ -47,3 +47,22 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# ---------------------------------------------------------------------------
+# Downloaded NOAA data (produced at runtime, never commit)
+# ---------------------------------------------------------------------------
+# Per-station output folders created by the app (named by ICAO, e.g. KJAN/)
+[A-Z][A-Z][A-Z][A-Z]/
+ghcnh_data/
+asos_data_1min/
+asos_data_5min/
+
+# Raw data file types
+*.psv
+*.dat
+*.gz
+*.ish
+_tmp_*.psv
+
+# Keep the bundled fallback station list tracked
+!ASOS_Stations.csv
