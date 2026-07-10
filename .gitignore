@@ -56,6 +56,7 @@ rsconnect/
 ghcnh_data/
 asos_data_1min/
 asos_data_5min/
+upper_air/
 
 # Raw data file types
 *.psv

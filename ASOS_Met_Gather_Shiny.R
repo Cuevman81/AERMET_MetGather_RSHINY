@@ -37,6 +37,10 @@ URL_BASE_1MIN <- "https://www.ncei.noaa.gov/data/automated-surface-observing-sys
 URL_BASE_5MIN <- "https://www.ncei.noaa.gov/data/automated-surface-observing-system-five-minute/access/"
 GHCNH_BASE    <- "https://www.ncei.noaa.gov/oa/global-historical-climatology-network/hourly/access/by-year"
 
+# Upper air: IGRA2 radiosonde soundings (the data AERMET turns into the .PFL profile)
+IGRA_STATION_URL <- "https://www.ncei.noaa.gov/pub/data/igra/igra2-station-list.txt"
+IGRA_POR_BASE    <- "https://www.ncei.noaa.gov/pub/data/igra/data/data-por"
+
 CURRENT_YEAR <- as.integer(format(Sys.Date(), "%Y"))
 
 # =============================================================================
@@ -117,6 +121,55 @@ EMPTY_STATIONS <- tibble(ICAO = character(), WBAN_ID = character(), USAF_ID = ch
                          STATION_NAME = character(), LAT = numeric(), LON = numeric())
 
 # =============================================================================
+# Upper-air station list: parse the IGRA2 fixed-width station inventory
+# =============================================================================
+# Documented IGRA2 station-list layout (note the gaps between fields):
+#   IGRA_ID 1-11  LAT 13-20  LON 22-30  ELEV 32-37  STATE 39-40
+#   NAME 42-71  FIRST_YEAR 73-76  LAST_YEAR 78-81  NUM_RECORDS 83-88
+EMPTY_IGRA <- tibble(IGRA_ID = character(), STATE = character(),
+                     STATION_NAME = character(), LAT = numeric(), LON = numeric(),
+                     FIRST_YEAR = integer(), LAST_YEAR = integer())
+
+IGRA_FWF <- readr::fwf_positions(
+  start = c(1, 13, 22, 32, 39, 42, 73, 78, 83),
+  end   = c(11, 20, 30, 37, 40, 71, 76, 81, 88),
+  col_names = c("IGRA_ID", "LAT", "LON", "ELEV", "STATE", "STATION_NAME",
+                "FIRST_YEAR", "LAST_YEAR", "NUM_RECORDS"))
+
+fetch_igra_stations <- function() {
+  resp <- tryCatch(httr::GET(IGRA_STATION_URL, httr::timeout(60)), error = function(e) NULL)
+  if (is.null(resp) || httr::status_code(resp) != 200) {
+    showNotification("Could not fetch the IGRA upper-air station list from NCEI.",
+                     type = "error", duration = NULL)
+    return(EMPTY_IGRA)
+  }
+  txt <- httr::content(resp, "text", encoding = "UTF-8")
+  df <- tryCatch(
+    readr::read_fwf(I(txt), IGRA_FWF, col_types = readr::cols(.default = "c"),
+                    progress = FALSE),
+    error = function(e) NULL)
+  if (is.null(df) || nrow(df) == 0) return(EMPTY_IGRA)
+
+  df %>%
+    mutate(
+      IGRA_ID = str_trim(IGRA_ID), STATE = str_trim(STATE),
+      STATION_NAME = str_trim(STATION_NAME),
+      LAT = suppressWarnings(as.numeric(LAT)),
+      LON = suppressWarnings(as.numeric(LON)),
+      FIRST_YEAR = suppressWarnings(as.integer(FIRST_YEAR)),
+      LAST_YEAR  = suppressWarnings(as.integer(LAST_YEAR))
+    ) %>%
+    filter(
+      substr(IGRA_ID, 1, 2) == "US",          # US soundings
+      !is.na(STATE), STATE != "",
+      !is.na(LAT), !is.na(LON),
+      !is.na(LAST_YEAR), LAST_YEAR >= (CURRENT_YEAR - 2)   # recently active
+    ) %>%
+    transmute(IGRA_ID, STATE, STATION_NAME, LAT, LON, FIRST_YEAR, LAST_YEAR) %>%
+    arrange(STATE, IGRA_ID)
+}
+
+# =============================================================================
 # Clear helpers
 # =============================================================================
 clear_asos_data <- function(icao, y1, y2) {
@@ -151,6 +204,19 @@ clear_ghcnh_data <- function(icao) {
     paste("Cleared GHCNh data for", icao)
   } else {
     paste("No GHCNh data directory found for", icao)
+  }
+}
+
+clear_ua_data <- function(igra_id) {
+  files <- list.files("upper_air", pattern = paste0("^", igra_id, "_UA_.*\\.txt$"),
+                      full.names = TRUE)
+  if (length(files)) {
+    file.remove(files)
+    if (dir.exists("upper_air") && length(list.files("upper_air")) == 0)
+      unlink("upper_air", recursive = TRUE, force = TRUE)
+    paste("Cleared", length(files), "upper-air file(s) for", igra_id)
+  } else {
+    paste("No upper-air data found for", igra_id)
   }
 }
 
@@ -198,10 +264,32 @@ ghcnh_ui <- function(id) {
   ))
 }
 
+ua_ui <- function(id) {
+  ns <- NS(id)
+  fluidPage(sidebarLayout(
+    sidebarPanel(
+      helpText("Upper-air radiosonde soundings (IGRA2) - the data AERMET uses to build ",
+               "the profile (.PFL). The full period-of-record is downloaded (can be ",
+               "~100 MB) and trimmed to the selected years."),
+      selectInput(ns("state"), "Filter by State", choices = NULL, selectize = FALSE),
+      station_map(ns, "map"),
+      selectizeInput(ns("station"), "Select Sounding Station (IGRA ID)", choices = NULL),
+      sliderInput(ns("y1"), "Start Year", min = 1960, max = CURRENT_YEAR,
+                  value = CURRENT_YEAR - 5, step = 1, sep = ""),
+      sliderInput(ns("y2"), "End Year", min = 1960, max = CURRENT_YEAR,
+                  value = CURRENT_YEAR - 1, step = 1, sep = ""),
+      actionButton(ns("download"), "Download Upper Air Data", class = "btn-primary"),
+      actionButton(ns("clear"), "Clear Downloaded Upper Air Data", class = "btn-danger")
+    ),
+    mainPanel(verbatimTextOutput(ns("status")))
+  ))
+}
+
 # =============================================================================
 # Shared server helper: state filter + station dropdown + leaflet map
 # =============================================================================
-wire_state_and_map <- function(input, output, session, stations, map_id, station_id) {
+wire_state_and_map <- function(input, output, session, stations, map_id,
+                               id_col = "ICAO", name_col = "STATION_NAME") {
   states <- reactive({
     df <- stations(); if (nrow(df)) sort(unique(df$STATE)) else character(0)
   })
@@ -216,8 +304,8 @@ wire_state_and_map <- function(input, output, session, stations, map_id, station
   })
   observe({
     df <- in_state()
-    choices <- if (nrow(df)) setNames(df$ICAO,
-                 paste0(df$ICAO, " - ", df$STATION_NAME)) else character(0)
+    choices <- if (nrow(df)) setNames(df[[id_col]],
+                 paste0(df[[id_col]], " - ", df[[name_col]])) else character(0)
     updateSelectizeInput(session, "station", choices = choices,
                          selected = if (length(choices)) choices[[1]] else NULL, server = TRUE)
   })
@@ -226,7 +314,9 @@ wire_state_and_map <- function(input, output, session, stations, map_id, station
     if (!nrow(df))
       return(leaflet() %>% addTiles() %>% setView(-98.583, 39.833, zoom = 3))
     leaflet(df) %>% addTiles() %>%
-      addMarkers(~LON, ~LAT, label = ~paste0(ICAO, " - ", STATION_NAME), layerId = ~ICAO) %>%
+      addMarkers(lng = df$LON, lat = df$LAT,
+                 label = paste0(df[[id_col]], " - ", df[[name_col]]),
+                 layerId = df[[id_col]]) %>%
       setView(mean(df$LON), mean(df$LAT), zoom = 6)
   })
   observeEvent(input[[paste0(map_id, "_marker_click")]], {
@@ -241,7 +331,7 @@ wire_state_and_map <- function(input, output, session, stations, map_id, station
 # =============================================================================
 asos_server <- function(id, stations) {
   moduleServer(id, function(input, output, session) {
-    wire_state_and_map(input, output, session, stations, "map", "station")
+    wire_state_and_map(input, output, session, stations, "map")
 
     observeEvent(input$download, {
       req(input$station, input$station != "")
@@ -293,7 +383,7 @@ asos_server <- function(id, stations) {
 # =============================================================================
 ghcnh_server <- function(id, stations) {
   moduleServer(id, function(input, output, session) {
-    wire_state_and_map(input, output, session, stations, "map", "station")
+    wire_state_and_map(input, output, session, stations, "map")
 
     observeEvent(input$download, {
       req(input$station, input$station != "")
@@ -355,6 +445,89 @@ ghcnh_server <- function(id, stations) {
 }
 
 # =============================================================================
+# Upper Air server  (IGRA2 radiosonde soundings -> AERMET .PFL profile input)
+# =============================================================================
+ua_server <- function(id, igra) {
+  moduleServer(id, function(input, output, session) {
+    wire_state_and_map(input, output, session, igra, "map", "IGRA_ID", "STATION_NAME")
+
+    observeEvent(input$download, {
+      req(input$station, input$station != "")
+      igra_id <- input$station; y1 <- input$y1; y2 <- min(input$y2, CURRENT_YEAR)
+      if (y2 < y1) { output$status <- renderText("End year must be >= start year."); return() }
+
+      info <- filter(igra(), IGRA_ID == igra_id) %>% slice(1)
+      cover <- if (nrow(info)) paste0(info$FIRST_YEAR, "-", info$LAST_YEAR) else "?"
+      dir.create("upper_air", showWarnings = FALSE)
+      out_file <- file.path("upper_air", sprintf("%s_UA_%d_%d.txt", igra_id, y1, y2))
+
+      log <- c(paste0("Upper-air download: ", igra_id,
+                      if (nrow(info)) paste0(" (", info$STATION_NAME, ")") else "",
+                      "  years ", y1, "-", y2, "   [record ", cover, "]"),
+               "Fetching full period-of-record zip from IGRA (this can take a minute)...")
+      output$status <- renderText(paste(log, collapse = "\n"))
+
+      old_to <- getOption("timeout"); options(timeout = 900); on.exit(options(timeout = old_to))
+      url <- sprintf("%s/%s-data.txt.zip", IGRA_POR_BASE, igra_id)
+      tmp_zip <- tempfile(fileext = ".zip"); tmp_dir <- tempfile()
+      n_kept <- 0L; ok <- FALSE
+
+      withProgress(message = paste("Downloading IGRA", igra_id), value = 0.1, {
+        dl <- tryCatch({
+          GET(url, timeout(600), write_disk(tmp_zip, overwrite = TRUE)); TRUE
+        }, error = function(e) FALSE)
+        if (dl && file.exists(tmp_zip) && file.info(tmp_zip)$size > 1000) {
+          incProgress(0.5, detail = "Unzipping and trimming to selected years...")
+          dir.create(tmp_dir, showWarnings = FALSE)
+          unzip(tmp_zip, exdir = tmp_dir)
+          data_file <- file.path(tmp_dir, paste0(igra_id, "-data.txt"))
+          if (file.exists(data_file)) {
+            con_in <- file(data_file, "r"); con_out <- file(out_file, "w")
+            cur_hdr <- NULL; cur_dat <- character(0)
+            flush_snd <- function() {
+              if (!is.null(cur_hdr)) {
+                yr <- suppressWarnings(as.numeric(substr(cur_hdr, 14, 17)))
+                if (!is.na(yr) && yr >= y1 && yr <= y2) {
+                  writeLines(c(cur_hdr, cur_dat), con_out); n_kept <<- n_kept + 1L
+                }
+              }
+            }
+            repeat {
+              line <- readLines(con_in, n = 1)
+              if (length(line) == 0) break
+              if (substr(line, 1, 1) == "#") { flush_snd(); cur_hdr <- line; cur_dat <- character(0) }
+              else cur_dat <- c(cur_dat, line)
+            }
+            flush_snd(); close(con_in); close(con_out); ok <- TRUE
+          }
+        }
+        incProgress(0.4, detail = "Done")
+      })
+      unlink(tmp_zip); unlink(tmp_dir, recursive = TRUE)
+
+      if (ok && n_kept > 0) {
+        log <- c(log, "",
+                 paste0("Kept ", n_kept, " soundings in ", y1, "-", y2, "."),
+                 paste0("Output: ", normalizePath(out_file, mustWork = FALSE)),
+                 "IGRA2 format - use as the AERMET Stage 1 upper-air (UPPERAIR) input.")
+      } else {
+        if (file.exists(out_file) && file.info(out_file)$size == 0) file.remove(out_file)
+        log <- c(log, "",
+                 if (!ok) "Download or unzip failed - check the station id and your connection."
+                 else paste0("No soundings found in ", y1, "-", y2,
+                             " (station record is ", cover, ")."))
+      }
+      output$status <- renderText(paste(log, collapse = "\n"))
+    })
+
+    observeEvent(input$clear, {
+      req(input$station, input$station != "")
+      output$status <- renderText(clear_ua_data(input$station))
+    })
+  })
+}
+
+# =============================================================================
 # App
 # =============================================================================
 ui <- fluidPage(
@@ -369,37 +542,47 @@ ui <- fluidPage(
   tabsetPanel(
     id = "tabs",
     tabPanel("ASOS 1/5-min Winds", asos_ui("asos")),
-    tabPanel("GHCNh Surface", ghcnh_ui("ghcnh"))
+    tabPanel("GHCNh Surface", ghcnh_ui("ghcnh")),
+    tabPanel("Upper Air (IGRA)", ua_ui("ua"))
   ),
   tags$hr(),
   tags$small(HTML(paste0(
     "Surface: <b>GHCNh</b> (NCEI) replaces the retired ISHD/DS3505 archive (Aug 2025). ",
-    "Winds: <b>1-minute ASOS</b> via AERMINUTE. Station metadata: NCEI isd-history.csv. ",
+    "Winds: <b>1-minute ASOS</b> via AERMINUTE. Upper air: <b>IGRA2</b> radiosonde ",
+    "soundings (AERMET .PFL). Station metadata: NCEI isd-history.csv. ",
     "Companion to the MDEQ <b>AERMET.R</b> pipeline."
   )))
 )
 
 server <- function(input, output, session) {
   stations <- reactiveVal(EMPTY_STATIONS)
+  igra     <- reactiveVal(EMPTY_IGRA)
 
   isolate({
-    shinyjs::html("load_status", "Fetching station list from NCEI, please wait...")
+    shinyjs::html("load_status", "Fetching station lists from NCEI, please wait...")
     showModal(modalDialog(title = "Loading Station Data",
-      "Fetching and filtering the NCEI ISD-history station list...",
+      "Fetching the NCEI ISD-history (surface) and IGRA2 (upper-air) station lists...",
       easyClose = FALSE, footer = NULL))
     s <- tryCatch(fetch_and_parse_stations(), error = function(e) NULL)
+    ig <- tryCatch(fetch_igra_stations(), error = function(e) NULL)
     removeModal()
-    if (!is.null(s) && nrow(s) > 0) {
-      stations(s)
-      shinyjs::html("load_status", paste0("Loaded ", nrow(s), " active US ASOS stations."))
+    if (!is.null(s) && nrow(s) > 0) stations(s) else stations(EMPTY_STATIONS)
+    if (!is.null(ig) && nrow(ig) > 0) igra(ig) else igra(EMPTY_IGRA)
+    n_sfc <- if (!is.null(s)) nrow(s) else 0
+    n_ua  <- if (!is.null(ig)) nrow(ig) else 0
+    if (n_sfc > 0) {
+      shinyjs::html("load_status",
+        paste0("Loaded ", n_sfc, " active US ASOS stations and ", n_ua,
+               " active US upper-air (IGRA) sites."))
     } else {
-      stations(EMPTY_STATIONS)
-      shinyjs::html("load_status", "ERROR: could not load a station list. Check network / bundled CSV.")
+      shinyjs::html("load_status",
+        "ERROR: could not load the surface station list. Check network / bundled CSV.")
     }
   })
 
   asos_server("asos", stations)
   ghcnh_server("ghcnh", stations)
+  ua_server("ua", igra)
 }
 
 shinyApp(ui, server)

@@ -8,6 +8,7 @@ two things, one per tab:
 |-----|------|-------|
 | **ASOS 1/5‑min Winds** | 1‑minute & 5‑minute ASOS observations | **AERMINUTE** (hourly winds & calms) |
 | **GHCNh Surface** | GHCNh hourly surface data (`.psv`) | **AERMET Stage 1** surface observations |
+| **Upper Air (IGRA)** | IGRA2 radiosonde soundings | **AERMET** upper‑air / profile (`.PFL`) |
 
 It is the front‑end companion to the [`AERMET.R`](../AERMINUTE/AERMET.R)
 processing script: the GHCNh files it produces are named exactly like the ones
@@ -39,9 +40,11 @@ processing script: the GHCNh files it produces are named exactly like the ones
 
 ## How it works
 
-1. **Startup** – the app downloads and filters `isd-history.csv` to active US
-   ASOS stations that have a valid WBAN (needed to build the GHCNh id). If the
-   live fetch fails it falls back to the bundled `ASOS_Stations.csv`.
+1. **Startup** – the app downloads two NCEI lists: `isd-history.csv` (filtered to
+   active US ASOS stations with a valid WBAN, for the surface tabs) and
+   `igra2-station-list.txt` (filtered to active US radiosonde sites, for the
+   upper‑air tab). If the surface fetch fails it falls back to the bundled
+   `ASOS_Stations.csv`.
 2. **Select** – pick a state (defaults to **MS**), then a station from the
    dropdown or by clicking a map marker, and a start/end year.
 3. **Download**
@@ -51,6 +54,10 @@ processing script: the GHCNh files it produces are named exactly like the ones
      `…/global-historical-climatology-network/hourly/access/by-year/YYYY/psv/GHCNh_<id>_YYYY.psv`
      is downloaded and concatenated (header kept once). Years with no data are
      skipped and reported rather than aborting the run.
+   - **Upper Air:** the station's full period‑of‑record zip
+     (`…/igra/data/data-por/<IGRA_ID>-data.txt.zip`, which can be ~100 MB) is
+     downloaded, and its soundings are **trimmed to the selected year range**
+     (matching how `AERMET.R` prepares the upper‑air input).
 4. **Output** (relative to the app's working directory):
 
    ```
@@ -58,6 +65,7 @@ processing script: the GHCNh files it produces are named exactly like the ones
      <YEAR>/asos_data_1min/<ICAO>_YYYYMM_1min.dat
      <YEAR>/asos_data_5min/<ICAO>_YYYYMM_5min.dat
      ghcnh_data/<ICAO>_GHCNh_<startYr>_<endYr>.psv
+   upper_air/<IGRA_ID>_UA_<startYr>_<endYr>.txt
    ```
 
 ---
@@ -80,10 +88,12 @@ internet connection is required for the station list and all downloads.
 
 ## Data sources
 
-- **Station metadata:** <https://www.ncei.noaa.gov/pub/data/noaa/isd-history.csv>
+- **Surface station metadata:** <https://www.ncei.noaa.gov/pub/data/noaa/isd-history.csv>
 - **ASOS 1‑minute:** <https://www.ncei.noaa.gov/data/automated-surface-observing-system-one-minute-pg1/access/>
 - **ASOS 5‑minute:** <https://www.ncei.noaa.gov/data/automated-surface-observing-system-five-minute/access/>
 - **GHCNh hourly:** <https://www.ncei.noaa.gov/oa/global-historical-climatology-network/hourly/access/by-year/>
+- **Upper‑air station list:** <https://www.ncei.noaa.gov/pub/data/igra/igra2-station-list.txt>
+- **Upper‑air soundings (IGRA2):** <https://www.ncei.noaa.gov/pub/data/igra/data/data-por/>
 
 ---
 
