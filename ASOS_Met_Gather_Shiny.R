@@ -469,6 +469,40 @@ clear_ua_data <- function(igra_id) {
 }
 
 # =============================================================================
+# Download helpers
+# =============================================================================
+# GET with one retry.  A 404 is NCEI saying it has no such file -- an answer, not a
+# failure -- so it is not retried and is reported separately from timeouts and other
+# errors.  Returns list(ok, status, reason, resp); status is NA when nothing came back.
+http_get <- function(url, timeout_s, dest = NULL, tries = 2L) {
+  status <- NA_integer_; reason <- ""
+  for (k in seq_len(tries)) {
+    r <- tryCatch(
+      if (is.null(dest)) GET(url, timeout(timeout_s))
+      else GET(url, timeout(timeout_s), write_disk(dest, overwrite = TRUE)),
+      error = function(e) e)
+    if (inherits(r, "error")) {
+      status <- NA_integer_; reason <- sub(":.*$", "", conditionMessage(r))
+    } else {
+      status <- status_code(r)
+      if (status == 200) return(list(ok = TRUE, status = 200L, reason = "", resp = r))
+      reason <- paste("HTTP", status)
+      if (status == 404) break
+    }
+  }
+  list(ok = FALSE, status = status, reason = reason, resp = NULL)
+}
+
+# c("1-min 2024-12", "5-min 2023-01", ...) -> one entry per month, or
+# "5-min 2023 (all 12 months)" when a whole year is missing.
+compact_months <- function(x) {
+  key <- sub("-\\d\\d$", "", x)
+  unlist(lapply(unique(key), function(k) {
+    m <- x[key == k]; if (length(m) == 12) paste0(k, " (all 12 months)") else m
+  }), use.names = FALSE)
+}
+
+# =============================================================================
 # UI modules
 # =============================================================================
 station_map <- function(ns, map_id) leafletOutput(ns(map_id), height = "300px")
@@ -589,6 +623,11 @@ asos_server <- function(id, stations) {
       output$status <- renderText(paste(log, collapse = "\n"))
 
       total <- (y2 - y1 + 1) * 12 * 2; ok1 <- 0; ok5 <- 0
+      not_at_ncei <- character(0); failed <- character(0)   # a missing month = more calms
+      note_miss <- function(r, what) {
+        if (isTRUE(r$status == 404)) not_at_ncei <<- c(not_at_ncei, what)
+        else failed <<- c(failed, sprintf("%s (%s)", what, r$reason))
+      }
       withProgress(message = paste("Downloading ASOS", icao), value = 0, {
         for (yr in y1:y2) {
           d1 <- file.path(icao, yr, "asos_data_1min")
@@ -599,23 +638,28 @@ asos_server <- function(id, stations) {
             mm <- sprintf("%02d", mo)
             incProgress(1/total, detail = paste("1-min", yr, mm))
             u1 <- paste0(URL_BASE_1MIN, yr, "/", mm, "/asos-1min-pg1-", icao, "-", yr, mm, ".dat")
-            r1 <- tryCatch(GET(u1, timeout(60)), error = function(e) NULL)
-            if (!is.null(r1) && status_code(r1) == 200) {
-              writeBin(content(r1, "raw"), file.path(d1, paste0(icao, "_", yr, mm, "_1min.dat"))); ok1 <- ok1 + 1
-            }
+            r1 <- http_get(u1, 60)
+            if (r1$ok) {
+              writeBin(content(r1$resp, "raw"), file.path(d1, paste0(icao, "_", yr, mm, "_1min.dat"))); ok1 <- ok1 + 1
+            } else note_miss(r1, paste0("1-min ", yr, "-", mm))
             incProgress(1/total, detail = paste("5-min", yr, mm))
             u5 <- paste0(URL_BASE_5MIN, yr, "/", mm, "/asos-5min-", icao, "-", yr, mm, ".dat")
-            r5 <- tryCatch(GET(u5, timeout(60)), error = function(e) NULL)
-            if (!is.null(r5) && status_code(r5) == 200) {
-              writeBin(content(r5, "raw"), file.path(d5, paste0(icao, "_", yr, mm, "_5min.dat"))); ok5 <- ok5 + 1
-            }
+            r5 <- http_get(u5, 60)
+            if (r5$ok) {
+              writeBin(content(r5$resp, "raw"), file.path(d5, paste0(icao, "_", yr, mm, "_5min.dat"))); ok5 <- ok5 + 1
+            } else note_miss(r5, paste0("5-min ", yr, "-", mm))
           }
         }
       })
       log <- c(log,
                paste0("Saved ", ok1, " one-minute and ", ok5, " five-minute monthly files."),
                paste0("Location: ", normalizePath(icao, mustWork = FALSE)),
-               if (ok1 + ok5 == 0) "No files returned - check ICAO/years (some sites lack 1-min data)." else "Done.")
+               if (length(not_at_ncei))
+                 paste0("Not at NCEI (HTTP 404): ", paste(compact_months(not_at_ncei), collapse = ", ")) else NULL,
+               if (length(failed)) paste0("FAILED, download again: ", paste(failed, collapse = ", ")) else NULL,
+               if (length(failed)) "Incomplete."
+               else if (ok1 + ok5 == 0) "No files returned - check ICAO/years (some sites lack 1-min data)."
+               else "Done.")
       output$status <- renderText(paste(log, collapse = "\n"))
     })
 
@@ -653,49 +697,72 @@ ghcnh_server <- function(id, stations) {
       log <- c(paste0("GHCNh download: ", icao, " (", ghcn_id, ")  ", y1, "-", y2), "")
       output$status <- renderText(paste(log, collapse = "\n"))
 
-      years <- y1:y2; got <- character(0); missed <- character(0); header_written <- FALSE
+      years <- y1:y2; got <- character(0); no_file <- character(0); failed <- character(0)
+      header <- NULL
+      fetch_year <- function(yr) {
+        url <- sprintf("%s/%d/psv/GHCNh_%s_%d.psv", GHCNH_BASE, yr, ghcn_id, yr)
+        tmp <- file.path(out_dir, sprintf("_tmp_%d.psv", yr))
+        on.exit(if (file.exists(tmp)) file.remove(tmp))
+        g <- http_get(url, 300, dest = tmp)
+        if (g$ok && !(file.exists(tmp) && file.info(tmp)$size > 1000)) {
+          g$ok <- FALSE; g$reason <- "empty or truncated file"
+        }
+        if (g$ok) {
+          g$lines <- readLines(tmp, warn = FALSE)
+          if (!is.null(header) && g$lines[1] != header) {
+            g$ok <- FALSE; g$reason <- paste("column layout differs from", got[1])
+          }
+        }
+        g
+      }
       old_to <- getOption("timeout"); options(timeout = 900); on.exit(options(timeout = old_to))
       withProgress(message = paste("Downloading GHCNh", icao), value = 0, {
         for (yr in years) {
           incProgress(1/length(years), detail = paste("Year", yr))
-          url <- sprintf("%s/%d/psv/GHCNh_%s_%d.psv", GHCNH_BASE, yr, ghcn_id, yr)
-          tmp <- file.path(out_dir, sprintf("_tmp_%d.psv", yr))
-          r <- tryCatch(GET(url, timeout(300), write_disk(tmp, overwrite = TRUE)),
-                        error = function(e) NULL)
-          if (!is.null(r) && status_code(r) == 200 && file.exists(tmp) && file.info(tmp)$size > 1000) {
-            ln <- readLines(tmp, warn = FALSE)
-            if (!header_written) { writeLines(ln, out_file); header_written <- TRUE }
-            else write(ln[-1], out_file, append = TRUE)
+          g <- fetch_year(yr)
+          if (g$ok) {
+            if (is.null(header)) { header <- g$lines[1]; writeLines(g$lines, out_file) }
+            else write(g$lines[-1], out_file, append = TRUE)
             got <- c(got, as.character(yr))
+          } else if (isTRUE(g$status == 404)) {
+            no_file <- c(no_file, as.character(yr))
           } else {
-            missed <- c(missed, as.character(yr))
+            failed <- c(failed, sprintf("%d (%s)", yr, g$reason)); break
           }
-          if (file.exists(tmp)) file.remove(tmp)
         }
       })
 
-      # AERMET ignores NCEI's quality codes, so screen the file exactly as AERMET.R does
-      # before anyone uses it (idempotent: AERMET.R re-screening it changes nothing).
-      qc <- if (length(got)) tryCatch(filter_ghcnh_quality(out_file, verbose = FALSE),
-                                      error = function(e) e) else NULL
+      qc <- NULL
+      if (length(failed)) {
+        if (file.exists(out_file)) file.remove(out_file)
+        log <- c(log, paste0("Download FAILED for: ", paste(failed, collapse = ", ")),
+                 "Nothing was written. Check the connection and try again.")
+      } else if (!length(got)) {
+        log <- c(log, paste0("NCEI has no GHCNh file for any year (HTTP 404). ",
+                             "Verify the station is a USW-type ASOS (id ", ghcn_id, ")."))
+      } else {
+        # AERMET ignores NCEI's quality codes, so screen the file exactly as AERMET.R does
+        # before anyone uses it (idempotent: AERMET.R re-screening it changes nothing).
+        qc <- tryCatch(filter_ghcnh_quality(out_file, verbose = FALSE), error = function(e) e)
+      }
       if (inherits(qc, "error")) {
         if (file.exists(out_file)) file.remove(out_file)
         log <- c(log, paste0("Quality screen FAILED (", conditionMessage(qc), ")."),
                  "The unscreened file was removed: NCEI's raw .psv is not safe to use in AERMET.")
-      } else if (length(got)) {
+      } else if (!is.null(qc)) {
         log <- c(log,
                  paste0("Combined file: ", normalizePath(out_file, mustWork = FALSE)),
                  paste0("Years included: ", paste(got, collapse = ", ")),
-                 if (length(missed)) paste0("No GHCNh data for: ", paste(missed, collapse = ", ")) else NULL,
+                 if (length(no_file)) paste0("WARNING: NCEI has no GHCNh file for ", paste(no_file, collapse = ", "),
+                                             ". The file is named ", y1, "-", y2, " but lacks ",
+                                             if (length(no_file) > 1) "those years" else "that year",
+                                             ", and AERMET.R will treat it as complete.") else NULL,
                  "", sprintf(paste0("Quality screen (same as AERMET.R's filter_ghcnh_quality): %d values ",
                                     "NCEI flagged suspect/erroneous, %d METAR wind mismatches and %d ",
                                     "short-SYNOP wind/sky decodes blanked."),
                              qc$rejected, qc$ws_crosscheck, qc$synop_misread),
                  paste0("QC log: ", basename(qc$log_file)),
                  "", "Drop-in for AERMET.R: same name and same screening as download_ghcnh() + filter_ghcnh_quality().")
-      } else {
-        log <- c(log, paste0("No GHCNh data returned for any year. ",
-                             "Verify the station is a USW-type ASOS (id ", ghcn_id, ")."))
       }
       output$status <- renderText(paste(log, collapse = "\n"))
     })
@@ -733,13 +800,11 @@ ua_server <- function(id, igra) {
       old_to <- getOption("timeout"); options(timeout = 900); on.exit(options(timeout = old_to))
       url <- sprintf("%s/%s-data.txt.zip", IGRA_POR_BASE, igra_id)
       tmp_zip <- tempfile(fileext = ".zip"); tmp_dir <- tempfile()
-      n_kept <- 0L; ok <- FALSE
+      n_kept <- 0L; ok <- FALSE; kept_ym <- character(0)
 
       withProgress(message = paste("Downloading IGRA", igra_id), value = 0.1, {
-        dl <- tryCatch({
-          GET(url, timeout(600), write_disk(tmp_zip, overwrite = TRUE)); TRUE
-        }, error = function(e) FALSE)
-        if (dl && file.exists(tmp_zip) && file.info(tmp_zip)$size > 1000) {
+        dl <- http_get(url, 600, dest = tmp_zip)
+        if (dl$ok && file.exists(tmp_zip) && file.info(tmp_zip)$size > 1000) {
           incProgress(0.5, detail = "Unzipping and trimming to selected years...")
           dir.create(tmp_dir, showWarnings = FALSE)
           unzip(tmp_zip, exdir = tmp_dir)
@@ -752,6 +817,7 @@ ua_server <- function(id, igra) {
                 yr <- suppressWarnings(as.numeric(substr(cur_hdr, 14, 17)))
                 if (!is.na(yr) && yr >= y1 && yr <= y2) {
                   writeLines(c(cur_hdr, cur_dat), con_out); n_kept <<- n_kept + 1L
+                  kept_ym <<- c(kept_ym, paste0(substr(cur_hdr, 14, 17), "-", substr(cur_hdr, 19, 20)))
                 }
               }
             }
@@ -769,14 +835,27 @@ ua_server <- function(id, igra) {
       unlink(tmp_zip); unlink(tmp_dir, recursive = TRUE)
 
       if (ok && n_kept > 0) {
+        per_yr <- table(substr(kept_ym, 1, 4))
+        # months inside the station's record and before this month that have no sounding
+        # at all (e.g. KLZK's Feb-Jul 2026 launch suspension)
+        a <- max(y1, info$FIRST_YEAR, na.rm = TRUE); b <- min(y2, info$LAST_YEAR, na.rm = TRUE)
+        want <- if (a <= b) as.vector(outer(a:b, sprintf("%02d", 1:12), paste, sep = "-")) else character(0)
+        want <- sort(want[want < format(Sys.Date(), "%Y-%m")])
+        empty <- setdiff(want, kept_ym)
         log <- c(log, "",
                  paste0("Kept ", n_kept, " soundings in ", y1, "-", y2, "."),
+                 paste0("Per year: ", paste(names(per_yr), as.integer(per_yr), collapse = ", ")),
+                 if (length(empty)) paste0("WARNING: no soundings in ", paste(compact_months(empty), collapse = ", "),
+                                           ". AERMET will have no upper air for those months.") else NULL,
                  paste0("Output: ", normalizePath(out_file, mustWork = FALSE)),
                  "IGRA2 format - use as the AERMET Stage 1 upper-air (UPPERAIR) input.")
       } else {
         if (file.exists(out_file) && file.info(out_file)$size == 0) file.remove(out_file)
         log <- c(log, "",
-                 if (!ok) "Download or unzip failed - check the station id and your connection."
+                 if (!dl$ok) paste0("Download failed (", dl$reason,
+                                    if (isTRUE(dl$status == 404)) ": IGRA has no file for this station id" else
+                                      " - check your connection and try again", ").")
+                 else if (!ok) "Unzip failed - the download was not a valid IGRA zip; try again."
                  else paste0("No soundings found in ", y1, "-", y2,
                              " (station record is ", cover, ")."))
       }
