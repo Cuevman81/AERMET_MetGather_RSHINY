@@ -51,8 +51,9 @@ rsconnect/
 # ---------------------------------------------------------------------------
 # Downloaded NOAA data (produced at runtime, never commit)
 # ---------------------------------------------------------------------------
-# Per-station output folders created by the app (named by ICAO, e.g. KJAN/)
-[A-Z][A-Z][A-Z][A-Z]/
+# Everything the app writes under <ICAO>/ is caught by the folder and file-type
+# rules below (a [A-Z]{4}/ folder rule also hid data/, test/, ... on a
+# case-insensitive Mac, where git sets core.ignorecase=true).
 ghcnh_data/
 asos_data_1min/
 asos_data_5min/
