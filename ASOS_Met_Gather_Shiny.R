@@ -49,6 +49,9 @@ CURRENT_YEAR <- as.integer(format(Sys.Date(), "%Y"))
 # Columns: USAF, WBAN, "STATION NAME", CTRY, STATE, ICAO, LAT, LON, "ELEV(M)",
 #          BEGIN, END  (END is yyyymmdd; active ASOS now show 2025-08-27, the
 #          ISHD retirement date, rather than the old 99991231 sentinel).
+# isd-history.csv stopped updating when ISHD was retired, so "recently active" is
+# measured against the file's own newest END year, not today's date (which would
+# empty the list on 1 Jan 2028, and already empties the older bundled copy).
 parse_isd_history <- function(raw_csv) {
   df <- suppressWarnings(readr::read_csv(
     raw_csv,
@@ -69,14 +72,16 @@ parse_isd_history <- function(raw_csv) {
       LON   = suppressWarnings(as.numeric(LON)),
       END_YR = suppressWarnings(as.integer(substr(END, 1, 4))),
       STATION_NAME = if (has_name) str_trim(STATION_NAME) else ""
-    ) %>%
+    )
+  ref_yr <- suppressWarnings(max(df$END_YR, na.rm = TRUE))   # the file's own vintage
+  df <- df %>%
     filter(
       CTRY == "US",
       !is.na(ICAO), ICAO != "", nchar(ICAO) == 4,
       !is.na(WBAN), WBAN != "", WBAN != "99999",
       !is.na(STATE), STATE != "",
       !is.na(LAT), !is.na(LON), !(LAT == 0 & LON == 0),
-      !is.na(END_YR), END_YR >= (CURRENT_YEAR - 2)   # recently active ASOS
+      !is.na(END_YR), END_YR >= (ref_yr - 1)   # recently active ASOS
     )
 
   # Keep one record per ICAO: the most recently active
