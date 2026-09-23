@@ -715,10 +715,15 @@ ghcnh_server <- function(id, stations) {
         }
         g
       }
+      # GHCNh by-year files hold UTC years and AERMET subtracts tadjust to reach local
+      # standard time, so the evening of 31 Dec of the last year -- and the whole of
+      # (y2+1)/01/01, where AERMET.R's XDATES end -- sit in the next year's file.
+      # Records up to (y2+1)-01-02 12:00 UTC cover that day for every US time zone.
+      tail_yr <- y2 + 1L; n_tail <- NA_integer_; tail_note <- NULL
       old_to <- getOption("timeout"); options(timeout = 900); on.exit(options(timeout = old_to))
       withProgress(message = paste("Downloading GHCNh", icao), value = 0, {
         for (yr in years) {
-          incProgress(1/length(years), detail = paste("Year", yr))
+          incProgress(1/(length(years) + 1), detail = paste("Year", yr))
           g <- fetch_year(yr)
           if (g$ok) {
             if (is.null(header)) { header <- g$lines[1]; writeLines(g$lines, out_file) }
@@ -728,6 +733,23 @@ ghcnh_server <- function(id, stations) {
             no_file <- c(no_file, as.character(yr))
           } else {
             failed <- c(failed, sprintf("%d (%s)", yr, g$reason)); break
+          }
+        }
+        if (!length(failed) && length(got)) {
+          incProgress(1/(length(years) + 1), detail = paste("First day of", tail_yr))
+          g <- if (tail_yr <= CURRENT_YEAR) fetch_year(tail_yr) else list(ok = FALSE, status = 404L)
+          if (g$ok) {
+            cut <- sprintf("%d-01-02T12:00:00", tail_yr)
+            dt  <- sub("^[^|]*\\|[^|]*\\|([^|]*)\\|.*$", "\\1", g$lines[-1])
+            keep <- g$lines[-1][dt < cut]
+            if (length(keep)) write(keep, out_file, append = TRUE)
+            n_tail <- length(keep)
+          } else {
+            tail_note <- sprintf(paste0("NOTE: %s, so the file stops at 31 Dec %d 23:59 UTC and ",
+                                        "the evening of 31 Dec %d (local standard time) is missing."),
+                                 if (isTRUE(g$status == 404)) sprintf("NCEI has no %d file yet", tail_yr)
+                                 else sprintf("the %d file could not be fetched (%s); download again", tail_yr, g$reason),
+                                 y2, y2)
           }
         }
       })
@@ -752,7 +774,10 @@ ghcnh_server <- function(id, stations) {
       } else if (!is.null(qc)) {
         log <- c(log,
                  paste0("Combined file: ", normalizePath(out_file, mustWork = FALSE)),
-                 paste0("Years included: ", paste(got, collapse = ", ")),
+                 paste0("Years included: ", paste(got, collapse = ", "),
+                        if (!is.na(n_tail)) sprintf("  (+ %d records of %d, to %d-01-02 12:00 UTC)",
+                                                    n_tail, tail_yr, tail_yr) else ""),
+                 tail_note,
                  if (length(no_file)) paste0("WARNING: NCEI has no GHCNh file for ", paste(no_file, collapse = ", "),
                                              ". The file is named ", y1, "-", y2, " but lacks ",
                                              if (length(no_file) > 1) "those years" else "that year",
