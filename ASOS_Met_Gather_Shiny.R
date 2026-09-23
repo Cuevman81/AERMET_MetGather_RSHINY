@@ -36,6 +36,7 @@ LOCAL_STATION_FALLBACK <- "ASOS_Stations.csv"   # bundled offline copy (same sch
 URL_BASE_1MIN <- "https://www.ncei.noaa.gov/data/automated-surface-observing-system-one-minute-pg1/access/"
 URL_BASE_5MIN <- "https://www.ncei.noaa.gov/data/automated-surface-observing-system-five-minute/access/"
 GHCNH_BASE    <- "https://www.ncei.noaa.gov/oa/global-historical-climatology-network/hourly/access/by-year"
+GHCNH_STATION_LIST_URL <- "https://www.ncei.noaa.gov/oa/global-historical-climatology-network/hourly/doc/ghcnh-station-list.csv"
 
 # Upper air: IGRA2 radiosonde soundings (the data AERMET turns into the .PFL profile)
 IGRA_STATION_URL <- "https://www.ncei.noaa.gov/pub/data/igra/igra2-station-list.txt"
@@ -493,6 +494,32 @@ http_get <- function(url, timeout_s, dest = NULL, tries = 2L) {
   list(ok = FALSE, status = status, reason = reason, resp = NULL)
 }
 
+# GHCNh id for an ASOS station.  US airports are USW000+WBAN, but Puerto Rico and the
+# Virgin Islands use RQW/VQW prefixes and a few sites have ICAO-based ids (KLNN is
+# USI0000KLNN), so when USW000+WBAN is not in NCEI's GHCNh station list (fetched once
+# per session) the ICAO is looked up there instead.  Keeps USW000+WBAN when it is
+# listed, when the list can't be fetched, or when there is no single better match.
+ghcnh_list_cache <- new.env()
+resolve_ghcnh_id <- function(icao, wban, default_id) {
+  if (is.null(ghcnh_list_cache$df)) {
+    g <- http_get(GHCNH_STATION_LIST_URL, 60)
+    if (g$ok) ghcnh_list_cache$df <- tryCatch(
+      readr::read_csv(I(content(g$resp, "text", encoding = "UTF-8")),
+                      col_types = readr::cols(.default = "c"), progress = FALSE,
+                      show_col_types = FALSE),
+      error = function(e) NULL)
+  }
+  df <- ghcnh_list_cache$df
+  if (is.null(df) || !all(c("GHCN_ID", "ICAO") %in% names(df))) return(default_id)
+  if (default_id %in% df$GHCN_ID) return(default_id)   # USW000+WBAN exists: use it
+  ids <- df$GHCN_ID[!is.na(df$ICAO) & df$ICAO == icao]
+  if (!length(ids)) return(default_id)
+  same_wban <- ids[endsWith(ids, wban)]              # e.g. TJSJ -> RQW00011641
+  if (length(same_wban) == 1) return(same_wban)
+  if (length(ids) == 1) return(ids)
+  default_id
+}
+
 # c("1-min 2024-12", "5-min 2023-01", ...) -> one entry per month, or
 # "5-min 2023 (all 12 months)" when a whole year is missing.
 compact_months <- function(x) {
@@ -686,7 +713,7 @@ ghcnh_server <- function(id, stations) {
       if (!nrow(info) || is.na(info$GHCNH_ID) || info$GHCNH_ID == "") {
         output$status <- renderText(paste("No GHCNh id (USW000+WBAN) available for", icao)); return()
       }
-      ghcn_id <- info$GHCNH_ID
+      ghcn_id <- resolve_ghcnh_id(icao, info$WBAN_ID, info$GHCNH_ID)
       out_dir <- file.path(icao, "ghcnh_data")
       dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
       out_file <- file.path(out_dir, sprintf("%s_GHCNh_%d_%d.psv", icao, y1, y2))
@@ -694,7 +721,10 @@ ghcnh_server <- function(id, stations) {
       if (file.exists(out_file)) file.remove(out_file)
       if (file.exists(qc_log)) file.remove(qc_log)     # belongs to the file just removed
 
-      log <- c(paste0("GHCNh download: ", icao, " (", ghcn_id, ")  ", y1, "-", y2), "")
+      log <- c(paste0("GHCNh download: ", icao, " (", ghcn_id, ")  ", y1, "-", y2),
+               if (ghcn_id != info$GHCNH_ID)
+                 paste0("  id from NCEI's GHCNh station list (", info$GHCNH_ID, " does not apply here)") else NULL,
+               "")
       output$status <- renderText(paste(log, collapse = "\n"))
 
       years <- y1:y2; got <- character(0); no_file <- character(0); failed <- character(0)
