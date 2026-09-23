@@ -35,8 +35,9 @@ The ASOS and upper‑air files keep their own names (`AERMET.R` looks for
   **ISD‑history CSV** (`https://www.ncei.noaa.gov/pub/data/noaa/isd-history.csv`)
   instead of the legacy fixed‑width `MASTER-STN-HIST.TXT` on `www1.ncdc.noaa.gov`
   (that host now 301‑redirects). Active‑station filtering was fixed for the new
-  reality that operating ASOS stations show an END date of `2025‑08‑27` (the
-  ISHD retirement date) rather than the old `99991231` sentinel.
+  reality that operating ASOS stations show an END date in late August 2025
+  (`20250825`–`20250827`, when ISHD stopped updating) rather than the old
+  `99991231` sentinel.
 - **All hosts moved to `www.ncei.noaa.gov`.**
 - **GHCNh output matches the pipeline:** `ICAO/ghcnh_data/<ICAO>_GHCNh_<startYr>_<endYr>.psv`.
 - **Year sliders extend to the current year;** default range is the last five
@@ -53,8 +54,9 @@ The ASOS and upper‑air files keep their own names (`AERMET.R` looks for
 
 1. **Startup** – the app downloads two NCEI lists: `isd-history.csv` (filtered to
    active US ASOS stations with a valid WBAN, for the surface tabs) and
-   `igra2-station-list.txt` (filtered to active US radiosonde sites, for the
-   upper‑air tab). If the surface fetch fails it falls back to the bundled
+   `igra2-station-list.txt` (all US radiosonde sites, for the upper‑air tab,
+   which lists those with soundings in the selected years). If the surface
+   fetch fails it falls back to the bundled
    `ASOS_Stations.csv`.
 2. **Select** – pick a state (defaults to **MS**), then a station from the
    dropdown or by clicking a map marker, and a start/end year.
@@ -142,8 +144,8 @@ not pinned (there is no `renv.lock`).
 - **Surface station metadata:** <https://www.ncei.noaa.gov/pub/data/noaa/isd-history.csv>
 - **ASOS 1‑minute:** <https://www.ncei.noaa.gov/data/automated-surface-observing-system-one-minute-pg1/access/>
 - **ASOS 5‑minute:** <https://www.ncei.noaa.gov/data/automated-surface-observing-system-five-minute/access/>
-- **GHCNh hourly:** <https://www.ncei.noaa.gov/oa/global-historical-climatology-network/hourly/access/by-year/>
-  (documentation and station list: <https://www.ncei.noaa.gov/oa/global-historical-climatology-network/hourly/doc/>)
+- **GHCNh hourly:** <https://www.ncei.noaa.gov/oa/global-historical-climatology-network/index.html#hourly/access/by-year/>
+  (documentation and station list: <https://www.ncei.noaa.gov/oa/global-historical-climatology-network/index.html#hourly/doc/>)
 - **Upper‑air station list:** <https://www.ncei.noaa.gov/pub/data/igra/igra2-station-list.txt>
 - **Upper‑air soundings (IGRA2):** <https://www.ncei.noaa.gov/pub/data/igra/data/data-por/>
 
