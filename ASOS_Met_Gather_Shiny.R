@@ -175,6 +175,181 @@ fetch_igra_stations <- function() {
 }
 
 # =============================================================================
+# GHCNh quality screen -- verbatim copy of AERMET.R's filter_ghcnh_quality()
+# (same block as aermet-runner backend/engine.R). Keep it verbatim so a fix made
+# in AERMET.R can be copied here unchanged.
+# =============================================================================
+# ------------------------------ GHCNh quality control --------------------------------
+#
+# AERMET reads the GHCNh .psv as delivered and does not honour NCEI's per-element
+# quality flags, so observations NCEI itself marked "suspect" or "erroneous" reach the
+# .sfc verbatim.  At KMEI that put 50 hours of 30.16 m/s into April-May 2025 (every one
+# of them qc=2 on a 3-hourly FM12 SYNOP report); KTUP 2025 carried 25 more.
+#
+# Two independent screens are applied.  Both only ever blank a value -- the element
+# becomes missing for that observation and AERMET falls back to AERMINUTE or to its own
+# substitution logic.  No record is dropped and no value is altered or invented, so the
+# edit stays defensible and is fully auditable from the log written beside the file.
+#
+#   1. Quality codes.  ISD/GHCNh codes 2 and 6 mean "suspect", 3 and 7 "erroneous";
+#      0/1/4/5/9 and blank pass.  Applied to every element carrying a *_Quality_Code.
+#
+#   2. Wind-speed cross-check.  NCEI carries the verbatim METAR/SPECI text in REM, so
+#      the decoded wind_speed can be checked against the report it came from.  KMEI
+#      2025-05-01 19:55Z and 19:58Z both decode to 54.1 m/s from a METAR that plainly
+#      reads 25010KT (5.1 m/s), and NCEI flags one of them qc=5 "passed all checks" --
+#      a decoding error the quality flags miss entirely.  Wind direction was checked
+#      the same way across 821,424 METAR groups with zero disagreement, so only speed
+#      is screened.
+#
+# The function is idempotent: a blanked value cannot be blanked twice, so re-running
+# the pipeline over an already-filtered .psv is a no-op.
+
+GHCNH_BAD_QC <- c("2", "3", "6", "7")   # suspect (2,6) and erroneous (3,7)
+GHCNH_WS_TOL <- 5                       # m/s; decoded-vs-METAR tolerance
+GHCNH_KT     <- 0.514444
+
+ghcnh_isopen <- function(cc) tryCatch(isOpen(cc), error = function(e) FALSE)
+
+# knots from the wind group of a METAR/SPECI report ("25010KT", "VRB03G15KT", ...)
+metar_wind_kt <- function(rem) {
+  m <- regmatches(rem, regexpr("\\b(\\d{3}|VRB)\\d{2,3}(G\\d{2,3})?KT\\b", rem))
+  if (!length(m)) return(NA_real_)
+  suppressWarnings(as.numeric(sub("^(\\d{3}|VRB)(\\d{2,3}).*$", "\\2", m)))
+}
+
+filter_ghcnh_quality <- function(psv_file, log_file = NULL, chunk = 20000L,
+                                 verbose = TRUE) {
+  if (!file.exists(psv_file) || file.size(psv_file) == 0)
+    stop("GHCNh file not found: ", psv_file)
+  if (is.null(log_file))
+    log_file <- sub("\\.psv$", "_qc_log.txt", psv_file)
+
+  con <- file(psv_file, "r"); out <- NULL
+  on.exit({
+    for (cc in list(con, out))
+      if (!is.null(cc) && inherits(cc, "connection") && ghcnh_isopen(cc))
+        try(close(cc), silent = TRUE)
+  }, add = TRUE)
+
+  header <- readLines(con, n = 1L, warn = FALSE)
+  cols   <- strsplit(header, "|", fixed = TRUE)[[1]]
+  ncol   <- length(cols)
+
+  qc_idx  <- grep("_Quality_Code$", cols); qc_idx <- qc_idx[qc_idx > 2L]
+  val_idx <- qc_idx - 2L            # layout: value, Measurement_Code, Quality_Code, ...
+  elem    <- sub("_Quality_Code$", "", cols[qc_idx])
+  keep    <- cols[val_idx] == elem  # only trust the pairing where it really lines up
+  qc_idx  <- qc_idx[keep]; val_idx <- val_idx[keep]; elem <- elem[keep]
+
+  i_ws  <- match("wind_speed", cols)
+  i_rem <- match("REM", cols)
+  i_t   <- match("DATE", cols); if (is.na(i_t)) i_t <- 3L
+
+  tmp <- paste0(psv_file, ".qctmp")
+  out <- file(tmp, "w")
+  writeLines(header, out)
+
+  counts <- setNames(integer(length(elem)), elem)
+  n_ws_x <- 0L
+  audit  <- list(); xaudit <- list()
+  nrec   <- 0L
+
+  repeat {
+    lines <- readLines(con, n = chunk, warn = FALSE)
+    if (!length(lines)) break
+    nrec <- nrec + length(lines)
+
+    f   <- strsplit(lines, "|", fixed = TRUE)
+    len <- lengths(f)
+    if (any(len < ncol))
+      f[len < ncol] <- lapply(f[len < ncol], function(v) c(v, rep("", ncol - length(v))))
+    m <- matrix(unlist(f, use.names = FALSE), nrow = length(f), byrow = TRUE)
+
+    # --- screen 1: NCEI quality codes ---
+    for (j in seq_along(qc_idx)) {
+      bad <- m[, qc_idx[j]] %in% GHCNH_BAD_QC & nzchar(m[, val_idx[j]])
+      if (!any(bad)) next
+      counts[j] <- counts[j] + sum(bad)
+      audit[[length(audit) + 1L]] <- data.frame(
+        timestamp = m[bad, i_t], element = elem[j],
+        value = m[bad, val_idx[j]], qc = m[bad, qc_idx[j]], stringsAsFactors = FALSE)
+      m[bad, val_idx[j]] <- ""
+    }
+
+    # --- screen 2: decoded wind speed vs the METAR it came from ---
+    if (!is.na(i_ws) && !is.na(i_rem)) {
+      w <- suppressWarnings(as.numeric(m[, i_ws]))
+      cand <- which(!is.na(w) & nzchar(m[, i_rem]))
+      if (length(cand)) {
+        kt <- vapply(m[cand, i_rem], metar_wind_kt, numeric(1), USE.NAMES = FALSE)
+        mw <- kt * GHCNH_KT
+        off <- which(!is.na(mw) & abs(mw - w[cand]) > GHCNH_WS_TOL)
+        if (length(off)) {
+          r <- cand[off]
+          n_ws_x <- n_ws_x + length(r)
+          xaudit[[length(xaudit) + 1L]] <- data.frame(
+            timestamp = m[r, i_t], decoded = m[r, i_ws],
+            metar = sprintf("%.1f", mw[off]), rem_kt = sprintf("%g", kt[off]),
+            stringsAsFactors = FALSE)
+          m[r, i_ws] <- ""
+        }
+      }
+    }
+
+    writeLines(apply(m, 1L, paste, collapse = "|"), out)
+  }
+
+  close(out); out <- NULL
+  close(con); con <- NULL
+  if (!file.rename(tmp, psv_file)) { unlink(tmp); stop("could not replace ", psv_file) }
+
+  hit <- counts[counts > 0]
+  lg <- c(sprintf("GHCNh quality-control filter log -- %s", basename(psv_file)),
+          sprintf("Applied: %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S")), "",
+          "Rejected values are blanked so AERMET treats the element as missing for that",
+          "observation.  No record is dropped and no value is altered or substituted.",
+          "",
+          sprintf("Records scanned        : %d", nrec),
+          sprintf("Screen 1 (NCEI flags)  : %d values rejected", sum(counts)),
+          sprintf("Screen 2 (METAR check) : %d wind speeds rejected", n_ws_x), "",
+          "SCREEN 1 -- NCEI quality codes 2/6 (suspect) and 3/7 (erroneous)")
+  if (length(hit)) {
+    aud <- do.call(rbind, audit)
+    lg <- c(lg, sprintf("   %-30s %6d", names(hit), hit), "",
+            "   Detail (timestamp | element | rejected value | quality code):",
+            sprintf("   %s | %s | %s | %s", aud$timestamp, aud$element, aud$value, aud$qc))
+  } else lg <- c(lg, "   none")
+  lg <- c(lg, "",
+          sprintf("SCREEN 2 -- decoded wind_speed vs METAR text (tolerance %g m/s)",
+                  GHCNH_WS_TOL))
+  if (n_ws_x) {
+    xa <- do.call(rbind, xaudit)
+    lg <- c(lg, "   Detail (timestamp | decoded m/s | METAR m/s | METAR kt):",
+            sprintf("   %s | %s | %s | %s", xa$timestamp, xa$decoded, xa$metar, xa$rem_kt))
+  } else lg <- c(lg, "   none")
+
+  # The log is the audit trail for values that are no longer present in the .psv, so
+  # it has to survive a re-run.  Re-processing an already-screened file rejects
+  # nothing; leave the existing log as it stands rather than overwriting it with
+  # zeroes and destroying the record of the first pass.
+  if (sum(counts) == 0 && n_ws_x == 0 && file.exists(log_file)) {
+    if (verbose)
+      cat(sprintf("QC filter: %s already screened; existing log left intact\n",
+                  basename(psv_file)))
+    return(invisible(list(records = nrec, rejected = 0L, ws_crosscheck = 0L,
+                          by_element = integer(0), log_file = log_file)))
+  }
+  writeLines(lg, log_file)
+
+  if (verbose)
+    cat(sprintf("QC filter: %s -- %d records, %d flagged + %d METAR-mismatch rejected\n",
+                basename(psv_file), nrec, sum(counts), n_ws_x))
+  invisible(list(records = nrec, rejected = sum(counts), ws_crosscheck = n_ws_x,
+                 by_element = hit, log_file = log_file))
+}
+
+# =============================================================================
 # Clear helpers
 # =============================================================================
 clear_asos_data <- function(icao, y1, y2) {
@@ -403,7 +578,9 @@ ghcnh_server <- function(id, stations) {
       out_dir <- file.path(icao, "ghcnh_data")
       dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
       out_file <- file.path(out_dir, sprintf("%s_GHCNh_%d_%d.psv", icao, y1, y2))
+      qc_log   <- sub("\\.psv$", "_qc_log.txt", out_file)
       if (file.exists(out_file)) file.remove(out_file)
+      if (file.exists(qc_log)) file.remove(qc_log)     # belongs to the file just removed
 
       log <- c(paste0("GHCNh download: ", icao, " (", ghcn_id, ")  ", y1, "-", y2), "")
       output$status <- renderText(paste(log, collapse = "\n"))
@@ -429,12 +606,24 @@ ghcnh_server <- function(id, stations) {
         }
       })
 
-      if (length(got)) {
+      # AERMET ignores NCEI's quality codes, so screen the file exactly as AERMET.R does
+      # before anyone uses it (idempotent: AERMET.R re-screening it changes nothing).
+      qc <- if (length(got)) tryCatch(filter_ghcnh_quality(out_file, verbose = FALSE),
+                                      error = function(e) e) else NULL
+      if (inherits(qc, "error")) {
+        if (file.exists(out_file)) file.remove(out_file)
+        log <- c(log, paste0("Quality screen FAILED (", conditionMessage(qc), ")."),
+                 "The unscreened file was removed: NCEI's raw .psv is not safe to use in AERMET.")
+      } else if (length(got)) {
         log <- c(log,
                  paste0("Combined file: ", normalizePath(out_file, mustWork = FALSE)),
                  paste0("Years included: ", paste(got, collapse = ", ")),
                  if (length(missed)) paste0("No GHCNh data for: ", paste(missed, collapse = ", ")) else NULL,
-                 "", "This .psv matches AERMET.R's download_ghcnh() output and can be used directly as SURFDATA.")
+                 "", sprintf(paste0("Quality screen (same as AERMET.R's filter_ghcnh_quality): %d values ",
+                                    "NCEI flagged suspect/erroneous and %d METAR wind mismatches blanked."),
+                             qc$rejected, qc$ws_crosscheck),
+                 paste0("QC log: ", basename(qc$log_file)),
+                 "", "Drop-in for AERMET.R: same name and same screening as download_ghcnh() + filter_ghcnh_quality().")
       } else {
         log <- c(log, paste0("No GHCNh data returned for any year. ",
                              "Verify the station is a USW-type ASOS (id ", ghcn_id, ")."))
