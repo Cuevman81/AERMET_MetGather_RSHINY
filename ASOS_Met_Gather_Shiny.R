@@ -169,7 +169,7 @@ fetch_igra_stations <- function() {
       substr(IGRA_ID, 1, 2) == "US",          # US soundings
       !is.na(STATE), STATE != "",
       !is.na(LAT), !is.na(LON),
-      !is.na(LAST_YEAR), LAST_YEAR >= (CURRENT_YEAR - 2)   # recently active
+      !is.na(LAST_YEAR)        # the Upper Air tab lists the sites active in its years
     ) %>%
     transmute(IGRA_ID, STATE, STATION_NAME, LAT, LON, FIRST_YEAR, LAST_YEAR) %>%
     arrange(STATE, IGRA_ID)
@@ -603,8 +603,8 @@ wire_state_and_map <- function(input, output, session, stations, map_id,
     df <- stations(); if (nrow(df)) sort(unique(df$STATE)) else character(0)
   })
   observe({
-    ch <- states()
-    sel <- if ("MS" %in% ch) "MS" else if (length(ch)) ch[1] else NULL
+    ch <- states(); cur <- isolate(input$state)   # keep the user's pick if still listed
+    sel <- if (!is.null(cur) && cur %in% ch) cur else if ("MS" %in% ch) "MS" else if (length(ch)) ch[1] else NULL
     updateSelectInput(session, "state", choices = ch, selected = sel)
   })
   in_state <- reactive({
@@ -615,8 +615,10 @@ wire_state_and_map <- function(input, output, session, stations, map_id,
     df <- in_state()
     choices <- if (nrow(df)) setNames(df[[id_col]],
                  paste0(df[[id_col]], " - ", df[[name_col]])) else character(0)
+    cur <- isolate(input$station)
     updateSelectizeInput(session, "station", choices = choices,
-                         selected = if (length(choices)) choices[[1]] else NULL, server = TRUE)
+                         selected = if (!is.null(cur) && cur %in% choices) cur
+                                    else if (length(choices)) choices[[1]] else NULL, server = TRUE)
   })
   output[[map_id]] <- renderLeaflet({
     df <- in_state()
@@ -834,7 +836,14 @@ ghcnh_server <- function(id, stations) {
 # =============================================================================
 ua_server <- function(id, igra) {
   moduleServer(id, function(input, output, session) {
-    wire_state_and_map(input, output, session, igra, "map", "IGRA_ID", "STATION_NAME")
+    # List the sites with soundings in the selected years, not just today's active
+    # ones, so retired sites stay available for past windows (Denver ended in 2022).
+    igra_win <- reactive({
+      df <- igra(); a <- input$y1; b <- input$y2
+      if (is.null(a) || is.null(b)) return(df)
+      filter(df, is.na(FIRST_YEAR) | FIRST_YEAR <= b, LAST_YEAR >= a)
+    })
+    wire_state_and_map(input, output, session, igra_win, "map", "IGRA_ID", "STATION_NAME")
 
     observeEvent(input$download, {
       req(input$station, input$station != "")
@@ -970,7 +979,7 @@ server <- function(input, output, session) {
     if (n_sfc > 0) {
       shinyjs::html("load_status",
         paste0("Loaded ", n_sfc, " active US ASOS stations and ", n_ua,
-               " active US upper-air (IGRA) sites."))
+               " US upper-air (IGRA) sites (listed by the years selected)."))
     } else {
       shinyjs::html("load_status",
         "ERROR: could not load the surface station list. Check network / bundled CSV.")
