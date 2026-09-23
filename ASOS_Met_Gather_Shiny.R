@@ -1,11 +1,12 @@
 # =============================================================================
 # AERMET NOAA Data Downloader  (R Shiny)
 # -----------------------------------------------------------------------------
-# Gathers the raw surface inputs needed to build AERMOD-ready met files with the
+# Gathers the raw inputs needed to build AERMOD-ready met files with the
 # MDEQ AERMET pipeline (AERMET.R):
 #
 #   * ASOS 1-minute & 5-minute data  -> drives AERMINUTE (hourly winds/calms)
 #   * GHCNh hourly surface data (.psv) -> AERMET Stage 1 surface observations
+#   * IGRA2 radiosonde soundings       -> AERMET Stage 1 upper air (.PFL profile)
 #
 # 2025/2026 modernization notes
 #   * The Integrated Surface Hourly (ISHD / DS3505) archive was retired by NCEI
@@ -16,7 +17,8 @@
 #     (`www.ncei.noaa.gov`), not the legacy `www1.ncdc.noaa.gov` fixed-width
 #     MASTER-STN-HIST.TXT (that host now 301-redirects).
 #   * GHCNh output is named `<ICAO>_GHCNh_<startYr>_<endYr>.psv`, matching the
-#     file AERMET.R's `download_ghcnh()` produces, so downloads are drop-in.
+#     file AERMET.R's `download_ghcnh()` produces, and is screened with the same
+#     filter_ghcnh_quality() (plus a short-SYNOP screen), so downloads are drop-in.
 #
 # Run:  shiny::runApp("ASOS_Met_Gather_Shiny.R")   (or open in RStudio, Run App)
 # =============================================================================
@@ -943,7 +945,7 @@ ui <- fluidPage(
     .btn-danger  { background-color:#b50909; border-color:#b50909; color:#fff; }
     #load_status { font-weight:600; color:#005ea2; }
   "))),
-  titlePanel("AERMET NOAA Data Downloader - ASOS 1/5-min + GHCNh"),
+  titlePanel("AERMET NOAA Data Downloader - ASOS 1/5-min + GHCNh + Upper Air"),
   p(id = "load_status", "Initializing..."),
   tabsetPanel(
     id = "tabs",
